@@ -1,5 +1,5 @@
 import io, os, shutil, zipfile, re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -7,11 +7,28 @@ import numpy as np
 import pandas as pd
 import pdfplumber
 import fitz  # PyMuPDF
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-APP = FastAPI(title="Recon Backend v16.22", version="1.0")
+# Import authentication (we'll create these files)
+try:
+    from auth import (
+        get_current_user, 
+        authenticate_user, 
+        create_access_token, 
+        get_password_hash,
+        ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+    from models import UserRegister, UserLogin, Token, UserResponse, UserInDB
+    from database import users_collection
+    AUTH_ENABLED = True
+except ImportError:
+    print("[WARNING] Authentication modules not found. Running without authentication.")
+    AUTH_ENABLED = False
+    get_current_user = None
+
+APP = FastAPI(title="Recon Backend v16.22 + Auth", version="1.0")
 
 ALLOWED_ORIGINS = os.getenv(
     "CORS_ALLOW_ORIGINS",
@@ -64,7 +81,7 @@ def _norm(s):
 def _to_amt(x):
     try:
         s = str(x).replace(",", "").strip()
-        if s in ["", "-", "â€”"]: return np.nan
+        if s in ["", "-", "Ã¢â‚¬â€"]: return np.nan
         if s.startswith("(") and s.endswith(")"): return -round(float(s[1:-1]), 2)
         return round(float(s), 2)
     except: return np.nan
@@ -294,7 +311,7 @@ def read_clean_axis_advance_xlsx(xlsx_path: Path) -> pd.DataFrame:
     df["Refer_No_UTR"] = df["UTR"].astype(str).str.strip().str.replace("^/XUTR/","",regex=True)
     return df
 
-# ---------- Step 2 (Bank Ã— Advance) ----------
+# ---------- Step 2 (Bank Ãƒâ€” Advance) ----------
 def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
     if bank_df.empty:
         return pd.DataFrame(), bank_df
@@ -322,7 +339,7 @@ def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
         not_in = bank_df.loc[~bank_df["Description"].isin(matched["Description"])]
     return matched, not_in
 
-# ---------- Step 3 (to MIS) â€” TPA-aware ----------
+# ---------- Step 3 (to MIS) Ã¢â‚¬â€ TPA-aware ----------
 def step3_map_to_mis(step2_df: pd.DataFrame, mis_path: Path, tpa_name: str) -> pd.DataFrame:
     if step2_df.empty:
         return pd.DataFrame()
@@ -355,7 +372,7 @@ def step3_map_to_mis(step2_df: pd.DataFrame, mis_path: Path, tpa_name: str) -> p
     )
     return merged.drop_duplicates()
 
-# ---------- Outstanding Parser (header hunting + block headers → 'Insurance Company Automated' + footer removal) ----------
+# ---------- Outstanding Parser (header hunting + block headers â†’ 'Insurance Company Automated' + footer removal) ----------
 
 # Only true per-block footer tokens (tight to avoid accidental drops)
 _FOOTER_TOKENS = ["SUB TOTAL", "SUBTOTAL", "TOTAL", "GRAND TOTAL"]
@@ -404,7 +421,7 @@ def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
     """
     Parse Outstanding Excel file with:
     - Header hunting (tolerant to position/typos)
-    - Block headers → 'Insurance Company Automated' column
+    - Block headers â†’ 'Insurance Company Automated' column
     - Footer removal
     """
     # Read with no header; file is already ensured to be .xlsx by ensure_xlsx
@@ -416,10 +433,10 @@ def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
     header_norm = []
     for h in header_vals:
         hn = str(h).strip()
-        # Consulatnt → Consultant (tolerant)
+        # Consulatnt â†’ Consultant (tolerant)
         if re.sub(r"[^A-Za-z]", "", hn).lower().startswith("consul"):
             hn = "Consultant"
-        # Insurance companies → Insurance Company
+        # Insurance companies â†’ Insurance Company
         if hn.strip().lower() == "insurance companies":
             hn = "Insurance Company"
         header_norm.append(hn)
@@ -495,11 +512,129 @@ def step4_strict_matches(step3_df: pd.DataFrame, outstanding_path: Path) -> pd.D
 @APP.get("/")
 async def root():
     """Health check endpoint"""
-    return {"status": "ok", "version": "16.22"}
+    return {"status": "ok", "version": "16.22+auth", "auth_enabled": AUTH_ENABLED}
+
+# ==================== AUTHENTICATION ENDPOINTS ====================
+
+@APP.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def register(user: UserRegister):
+    """
+    Register a new user
+    
+    Body:
+    - username: string (3-50 chars, alphanumeric + _ -)
+    - password: string (min 6 chars)
+    - email: string (optional)
+    - full_name: string (optional)
+    """
+    if not AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+    
+    if users_collection is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    
+    # Check if user already exists
+    existing_user = users_collection.find_one({"username": user.username})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already registered"
+        )
+    
+    # Create new user
+    user_dict = {
+        "username": user.username,
+        "email": user.email,
+        "full_name": user.full_name,
+        "hashed_password": get_password_hash(user.password),
+        "created_at": datetime.utcnow(),
+        "is_active": True
+    }
+    
+    try:
+        result = users_collection.insert_one(user_dict)
+        user_dict["_id"] = str(result.inserted_id)
+        
+        return UserResponse(
+            username=user_dict["username"],
+            email=user_dict.get("email"),
+            full_name=user_dict.get("full_name"),
+            created_at=user_dict["created_at"]
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create user: {str(e)}"
+        )
+
+@APP.post("/auth/login", response_model=Token)
+async def login(
+    username: str = Form(...),
+    password: str = Form(...)
+):
+    """
+    Login to get access token
+    
+    Form Data (application/x-www-form-urlencoded):
+    - username: string
+    - password: string
+    
+    Returns:
+    - access_token: JWT token (valid for 7 days)
+    - token_type: "bearer"
+    """
+    print(f"[Login] Received login request for username: {username}")
+    
+    if not AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+    
+    user = authenticate_user(username, password)
+    if not user:
+        print(f"[Login] Authentication failed for username: {username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    print(f"[Login] Authentication successful for username: {username}")
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    
+    print(f"[Login] Token created for username: {username}")
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@APP.get("/auth/me", response_model=UserResponse)
+async def get_current_user_info(current_user: UserInDB = Depends(get_current_user)):
+    """
+    Get current logged-in user information
+    
+    Requires: Authorization header with Bearer token
+    """
+    if not AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+    
+    return UserResponse(
+        username=current_user.username,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        created_at=current_user.created_at
+    )
+
+# ==================== PROTECTED ENDPOINTS ====================
+# All reconciliation endpoints now require authentication
 
 @APP.get("/download/{run_id}/{filename}")
-async def download_file(run_id: str, filename: str):
-    """Download a specific file from a run"""
+async def download_file(
+    run_id: str, 
+    filename: str,
+    current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
+):
+    """Download a specific file from a run (PROTECTED)"""
     file_path = RUN_ROOT / run_id / filename
     
     print(f"[Download] Requested: {filename}")
@@ -536,17 +671,18 @@ async def download_file(run_id: str, filename: str):
     )
 
 @APP.get("/tpa-choices")
-async def get_tpa_choices():
-    """Returns list of available TPA choices"""
+async def get_tpa_choices(current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None):
+    """Returns list of available TPA choices (PROTECTED)"""
     return {"tpa_choices": TPA_CHOICES}
 
 @APP.post("/reconcile/step1")
 async def reconcile_step1(
     bank_type: str = Form(...),
     bank_file: UploadFile = File(...),
-    advance_file: UploadFile = File(...)
+    advance_file: UploadFile = File(...),
+    current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
 ):
-    """Step-1: Upload Bank + Advance files based on bank type"""
+    """Step-1: Upload Bank + Advance files based on bank type (PROTECTED)"""
     global CURRENT_RUN_DIR, CURRENT_BANK_TYPE
     try:
         CURRENT_RUN_DIR = new_run_dir()
@@ -614,8 +750,8 @@ async def reconcile_step1(
         raise HTTPException(status_code=400, detail=str(e))
 
 @APP.post("/reconcile/step2")
-async def reconcile_step2():
-    """Step-2: Match Bank with Advance (no upload needed)"""
+async def reconcile_step2(current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None):
+    """Step-2: Match Bank with Advance (no upload needed) (PROTECTED)"""
     global CURRENT_RUN_DIR, CURRENT_BANK_TYPE
     if CURRENT_RUN_DIR is None:
         raise HTTPException(status_code=400, detail="Run not initialized. Complete Step-1 first.")
@@ -660,9 +796,10 @@ async def reconcile_step2():
 @APP.post("/reconcile/step3")
 async def reconcile_step3(
     tpa_name: str = Form(...),
-    mis_file: UploadFile = File(...)
+    mis_file: UploadFile = File(...),
+    current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
 ):
-    """Step-3: Map to MIS with TPA selection"""
+    """Step-3: Map to MIS with TPA selection (PROTECTED)"""
     global CURRENT_RUN_DIR
     if CURRENT_RUN_DIR is None:
         raise HTTPException(status_code=400, detail="Run not initialized. Complete Step-1 & Step-2 first.")
@@ -702,8 +839,11 @@ async def reconcile_step3(
         raise HTTPException(status_code=400, detail=str(e))
 
 @APP.post("/reconcile/step4")
-async def reconcile_step4(outstanding_file: UploadFile = File(...)):
-    """Step-4: Outstanding match and create ZIP"""
+async def reconcile_step4(
+    outstanding_file: UploadFile = File(...),
+    current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
+):
+    """Step-4: Outstanding match and create ZIP (PROTECTED)"""
     global CURRENT_RUN_DIR
     if CURRENT_RUN_DIR is None:
         raise HTTPException(status_code=400, detail="Run not initialized. Complete previous steps first.")
