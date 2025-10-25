@@ -5,20 +5,22 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
+
+# Try to load .env for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from database import users_collection
 from models import TokenData, UserInDB
-
-# Load environment variables
-load_dotenv()
 
 # Security configuration
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
-    raise ValueError(
-        "SECRET_KEY not found in environment variables. "
-        "Please add SECRET_KEY to your .env file."
-    )
+    print("[Auth] ⚠️ WARNING: SECRET_KEY not set! Using insecure default.")
+    SECRET_KEY = "insecure-default-key-change-this-in-production"
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
@@ -31,11 +33,27 @@ security = HTTPBearer()
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a plain password against its hash"""
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        # Bcrypt has a 72 byte limit - truncate if necessary
+        if len(plain_password.encode('utf-8')) > 72:
+            print(f"[Auth] Warning: Password truncated to 72 bytes for bcrypt")
+            plain_password = plain_password[:72]
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        print(f"[Auth] Password verification error: {e}")
+        return False
 
 def get_password_hash(password: str) -> str:
     """Hash a password"""
-    return pwd_context.hash(password)
+    try:
+        # Bcrypt has a 72 byte limit - truncate if necessary
+        if len(password.encode('utf-8')) > 72:
+            print(f"[Auth] Warning: Password truncated to 72 bytes for bcrypt")
+            password = password[:72]
+        return pwd_context.hash(password)
+    except Exception as e:
+        print(f"[Auth] Password hashing error: {e}")
+        raise
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Create JWT access token"""
