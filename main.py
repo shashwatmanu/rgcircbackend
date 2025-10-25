@@ -30,14 +30,22 @@ except ImportError:
 
 APP = FastAPI(title="Recon Backend v16.22 + Auth", version="1.0")
 
-ALLOWED_ORIGINS = os.getenv(
-    "CORS_ALLOW_ORIGINS",
-    "http://localhost:3000,https://recondb.vercel.app"
-).split(",")
+# CORS Configuration with detailed logging
+cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "")
+print(f"[CORS] Environment variable CORS_ALLOW_ORIGINS: '{cors_origins_env}'")
+
+if cors_origins_env:
+    ALLOWED_ORIGINS = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+else:
+    # Default origins if environment variable is not set
+    ALLOWED_ORIGINS = ["http://localhost:3000", "https://recondb.vercel.app"]
+    print("[CORS] Using default origins (env var not set)")
+
+print(f"[CORS] Final allowed origins: {ALLOWED_ORIGINS}")
 
 APP.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -81,7 +89,7 @@ def _norm(s):
 def _to_amt(x):
     try:
         s = str(x).replace(",", "").strip()
-        if s in ["", "-", "Ã¢â‚¬â€"]: return np.nan
+        if s in ["", "-", "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â"]: return np.nan
         if s.startswith("(") and s.endswith(")"): return -round(float(s[1:-1]), 2)
         return round(float(s), 2)
     except: return np.nan
@@ -311,7 +319,7 @@ def read_clean_axis_advance_xlsx(xlsx_path: Path) -> pd.DataFrame:
     df["Refer_No_UTR"] = df["UTR"].astype(str).str.strip().str.replace("^/XUTR/","",regex=True)
     return df
 
-# ---------- Step 2 (Bank Ãƒâ€” Advance) ----------
+# ---------- Step 2 (Bank ÃƒÆ’Ã¢â‚¬â€ Advance) ----------
 def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
     if bank_df.empty:
         return pd.DataFrame(), bank_df
@@ -339,7 +347,7 @@ def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
         not_in = bank_df.loc[~bank_df["Description"].isin(matched["Description"])]
     return matched, not_in
 
-# ---------- Step 3 (to MIS) Ã¢â‚¬â€ TPA-aware ----------
+# ---------- Step 3 (to MIS) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â TPA-aware ----------
 def step3_map_to_mis(step2_df: pd.DataFrame, mis_path: Path, tpa_name: str) -> pd.DataFrame:
     if step2_df.empty:
         return pd.DataFrame()
@@ -372,7 +380,7 @@ def step3_map_to_mis(step2_df: pd.DataFrame, mis_path: Path, tpa_name: str) -> p
     )
     return merged.drop_duplicates()
 
-# ---------- Outstanding Parser (header hunting + block headers â†’ 'Insurance Company Automated' + footer removal) ----------
+# ---------- Outstanding Parser (header hunting + block headers Ã¢â€ â€™ 'Insurance Company Automated' + footer removal) ----------
 
 # Only true per-block footer tokens (tight to avoid accidental drops)
 _FOOTER_TOKENS = ["SUB TOTAL", "SUBTOTAL", "TOTAL", "GRAND TOTAL"]
@@ -421,7 +429,7 @@ def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
     """
     Parse Outstanding Excel file with:
     - Header hunting (tolerant to position/typos)
-    - Block headers â†’ 'Insurance Company Automated' column
+    - Block headers Ã¢â€ â€™ 'Insurance Company Automated' column
     - Footer removal
     """
     # Read with no header; file is already ensured to be .xlsx by ensure_xlsx
@@ -433,10 +441,10 @@ def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
     header_norm = []
     for h in header_vals:
         hn = str(h).strip()
-        # Consulatnt â†’ Consultant (tolerant)
+        # Consulatnt Ã¢â€ â€™ Consultant (tolerant)
         if re.sub(r"[^A-Za-z]", "", hn).lower().startswith("consul"):
             hn = "Consultant"
-        # Insurance companies â†’ Insurance Company
+        # Insurance companies Ã¢â€ â€™ Insurance Company
         if hn.strip().lower() == "insurance companies":
             hn = "Insurance Company"
         header_norm.append(hn)
@@ -512,7 +520,13 @@ def step4_strict_matches(step3_df: pd.DataFrame, outstanding_path: Path) -> pd.D
 @APP.get("/")
 async def root():
     """Health check endpoint"""
-    return {"status": "ok", "version": "16.22+auth", "auth_enabled": AUTH_ENABLED}
+    return {
+        "status": "ok", 
+        "version": "16.22+auth", 
+        "auth_enabled": AUTH_ENABLED,
+        "cors_origins": ALLOWED_ORIGINS,
+        "mongodb_connected": users_collection is not None if AUTH_ENABLED else "N/A"
+    }
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
 
