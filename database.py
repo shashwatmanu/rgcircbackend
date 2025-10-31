@@ -20,6 +20,7 @@ if not MONGODB_URI:
     client = None
     db = None
     users_collection = None
+    activity_logs_collection = None
 else:
     # Database name
     DB_NAME = "recon_db"
@@ -38,18 +39,29 @@ else:
         
         db = client[DB_NAME]
         users_collection = db["users"]
+        activity_logs_collection = db["activity_logs"]  # NEW: Activity tracking
         
         # Create unique index on username
         users_collection.create_index("username", unique=True)
-        print(f"[MongoDB] Database '{DB_NAME}' initialized")
+        
+        # Create indexes for activity logs (for fast queries)
+        activity_logs_collection.create_index("username")
+        activity_logs_collection.create_index("timestamp")
+        activity_logs_collection.create_index([("username", 1), ("timestamp", -1)])
+        
+        print(f"[MongoDB] Database '{DB_NAME}' initialized with collections:")
+        print(f"  - users")
+        print(f"  - activity_logs")
         
     except ConnectionFailure as e:
         print(f"[MongoDB] ❌ Connection failed: {e}")
         client = None
         db = None
         users_collection = None
+        activity_logs_collection = None
     except Exception as e:
         print(f"[MongoDB] ❌ Unexpected error: {e}")
         client = None
         db = None
         users_collection = None
+        activity_logs_collection = None

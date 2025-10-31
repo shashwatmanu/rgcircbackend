@@ -1,7 +1,7 @@
 import io, os, shutil, zipfile, re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import pandas as pd
@@ -20,8 +20,11 @@ try:
         get_password_hash,
         ACCESS_TOKEN_EXPIRE_MINUTES
     )
-    from models import UserRegister, UserLogin, Token, UserResponse, UserInDB
-    from database import users_collection
+    from models import (
+        UserRegister, UserLogin, Token, UserResponse, UserInDB,
+        ActivityLog, UserStatsResponse, ActivityResponse, DailyActivityResponse
+    )
+    from database import users_collection, activity_logs_collection
     AUTH_ENABLED = True
 except ImportError:
     print("[WARNING] Authentication modules not found. Running without authentication.")
@@ -30,22 +33,14 @@ except ImportError:
 
 APP = FastAPI(title="Recon Backend v16.22 + Auth", version="1.0")
 
-# CORS Configuration with detailed logging
-cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "")
-print(f"[CORS] Environment variable CORS_ALLOW_ORIGINS: '{cors_origins_env}'")
-
-if cors_origins_env:
-    ALLOWED_ORIGINS = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
-else:
-    # Default origins if environment variable is not set
-    ALLOWED_ORIGINS = ["http://localhost:3000", "https://recondb.vercel.app"]
-    print("[CORS] Using default origins (env var not set)")
-
-print(f"[CORS] Final allowed origins: {ALLOWED_ORIGINS}")
+ALLOWED_ORIGINS = os.getenv(
+    "CORS_ALLOW_ORIGINS",
+    "http://localhost:3000,https://recondb.vercel.app"
+).split(",")
 
 APP.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,24 +57,106 @@ CURRENT_BANK_TYPE: Optional[str] = None
 TPA_CHOICES = [
     "IHX (Original MIS)",
     "CARE HEALTH INSURANCE LIMITED",
+    "HEALTH INDIA INSURANCE TPA SERVICES PRIVATE LTD.",
+    "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED",
+    "MEDSAVE HEALTHCARE TPA PVT LTD",
+    "PARAMOUNT HEALTHCARE",
+    "PARK MEDICLAIM INSURANCE TPA PRIVATE LIMITED",
+    "SAFEWAY INSURANCE TPA PVT.LTD",
+    "STAR HEALTH & ALLIED HEALTH INSURANCE CO.LTD.",
+    "VOLO HEALTH INSURANCE TPA PVT.LTD (EWA) (Mail Extract)"
 ]
 
-CANON_COLS = ["Cheque/ NEFT/ UTR No.", "Patient Name", "In Patient Number", "Settled Amount"]
+CANON_COLS = ["Cheque/ NEFT/ UTR No.", "Patient Name", "Settled Amount"]
 
 TPA_MIS_MAPS = {
     "IHX (Original MIS)": {
         "Cheque/ NEFT/ UTR No.": "Cheque/ NEFT/ UTR No.",
         "Patient Name": "Patient Name",
-        "In Patient Number": "In Patient Number",
         "Settled Amount": "Settled Amount",
     },
     "CARE HEALTH INSURANCE LIMITED": {
         "Cheque/ NEFT/ UTR No.": "NEFT Number",
         "Patient Name": "Patient Name",
-        "In Patient Number": "AL Number",
         "Settled Amount": "Settled Amount",
     },
+    "HEALTH INDIA INSURANCE TPA SERVICES PRIVATE LTD.": {
+        "Cheque/ NEFT/ UTR No.": "utrnumber",
+        "Patient Name": "Patient Name",
+        "Settled Amount": "SettledAmount",
+    },
+    "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED": {
+        "Cheque/ NEFT/ UTR No.": "UTR No",
+        "Patient Name": "Insuredname",
+        "Settled Amount": "Approved_Amount",
+    },
+    "MEDSAVE HEALTHCARE TPA PVT LTD": {
+        "Cheque/ NEFT/ UTR No.": "UTR/Chq No.",
+        "Patient Name": "Patient Name",
+        "Settled Amount": "Net Approved Amt",
+    },
+    "PARAMOUNT HEALTHCARE": {
+        "Cheque/ NEFT/ UTR No.": "UTR_NO",
+        "Patient Name": "NAME",
+        "Settled Amount": "AMOUNT_PAID",
+    },
+    "PARK MEDICLAIM INSURANCE TPA PRIVATE LIMITED": {
+        "Cheque/ NEFT/ UTR No.": "Chq No",
+        "Patient Name": "Insured Name",
+        "Settled Amount": "Grant Amount",
+    },
+    "SAFEWAY INSURANCE TPA PVT.LTD": {
+        "Cheque/ NEFT/ UTR No.": "'Chequeno",
+        "Patient Name": "'PatientName",
+        "Settled Amount": "'ApprovedAmt",
+    },
+    "STAR HEALTH & ALLIED HEALTH INSURANCE CO.LTD.": {
+        "Cheque/ NEFT/ UTR No.": "UTR",
+        "Patient Name": "Patient Name",
+        "Settled Amount": "Claim Net Pay Amount",
+    },
+    "VOLO HEALTH INSURANCE TPA PVT.LTD (EWA) (Mail Extract)": {
+        "Cheque/ NEFT/ UTR No.": "UTR Number",
+        "Patient Name": "Claimant Name",
+        "Settled Amount": "Total_Payment_Recd",
+    }
 }
+
+# ---------- Activity Logging Helper ----------
+def log_activity(
+    username: str,
+    bank_type: str,
+    step_completed: int,
+    run_id: str,
+    duration_seconds: Optional[int] = None,
+    row_counts: Optional[dict] = None,
+    tpa_name: Optional[str] = None,
+    success: bool = True,
+    error_message: Optional[str] = None
+):
+    """Log reconciliation activity to database"""
+    if activity_logs_collection is None:
+        print("[Activity] Logging disabled (no database connection)")
+        return
+    
+    try:
+        activity = {
+            "username": username,
+            "bank_type": bank_type,
+            "step_completed": step_completed,
+            "run_id": run_id,
+            "timestamp": datetime.utcnow(),
+            "duration_seconds": duration_seconds,
+            "row_counts": row_counts or {},
+            "tpa_name": tpa_name,
+            "success": success,
+            "error_message": error_message
+        }
+        
+        activity_logs_collection.insert_one(activity)
+        print(f"[Activity] Logged: {username} - Step {step_completed} - {bank_type}")
+    except Exception as e:
+        print(f"[Activity] Failed to log activity: {e}")
 
 # ---------- Helpers ----------
 def _norm(s):
@@ -501,32 +578,26 @@ def step4_strict_matches(step3_df: pd.DataFrame, outstanding_path: Path) -> pd.D
     for col in ["Patient Name","CR No","Balance"]:
         if col not in out.columns:
             raise ValueError(f"Outstanding missing '{col}'.")
-    for col in ["Patient Name","In Patient Number","Settled Amount"]:
+    # ↓↓↓ UPDATED: only need Patient Name + Settled Amount in Step-3
+    for col in ["Patient Name","Settled Amount"]:
         if col not in step3_df.columns:
             raise ValueError(f"Step-3 missing '{col}'.")
     L = out.copy(); R = step3_df.copy()
     L["_PNORM"] = L["Patient Name"].apply(_norm)
     R["_PNORM"] = R["Patient Name"].apply(_norm)
-    L["_CRNORM"] = L["CR No"].apply(_norm)
-    R["_CRNORM"] = R["In Patient Number"].apply(_norm)
-    merged = L.merge(R, on=["_PNORM","_CRNORM"], how="inner", suffixes=("_out","_m3"))
+    # ↓↓↓ UPDATED: only merge on Patient Name (no CR No matching)
+    merged = L.merge(R, on=["_PNORM"], how="inner", suffixes=("_out","_m3"))
     bal  = merged["Balance"].apply(_to_amt)
     sett = merged["Settled Amount"].apply(_to_amt)
     ok_mask = (bal.notna() & sett.notna() & (bal == sett))
-    return merged.loc[ok_mask].drop(columns=["_PNORM","_CRNORM"]).drop_duplicates()
+    return merged.loc[ok_mask].drop(columns=["_PNORM"]).drop_duplicates()
 
 # ---------- API Endpoints ----------
 
 @APP.get("/")
 async def root():
     """Health check endpoint"""
-    return {
-        "status": "ok", 
-        "version": "16.22+auth", 
-        "auth_enabled": AUTH_ENABLED,
-        "cors_origins": ALLOWED_ORIGINS,
-        "mongodb_connected": users_collection is not None if AUTH_ENABLED else "N/A"
-    }
+    return {"status": "ok", "version": "16.22+auth", "auth_enabled": AUTH_ENABLED}
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
 
@@ -745,6 +816,20 @@ async def reconcile_step1(
         print(f"[Step1] Files saved: {out_bank.name}, {out_adv.name}")
         print(f"[Step1] Files exist: bank={out_bank.exists()}, advance={out_adv.exists()}")
         
+        # Log activity
+        if current_user:
+            log_activity(
+                username=current_user.username,
+                bank_type=bank_type,
+                step_completed=1,
+                run_id=run_id,
+                row_counts={
+                    "bank_rows": len(bank_df),
+                    "advance_rows": len(adv_df)
+                },
+                success=True
+            )
+        
         return {
             "status": "success",
             "run_id": run_id,
@@ -792,6 +877,20 @@ async def reconcile_step2(current_user: UserInDB = Depends(get_current_user) if 
         save_xlsx(s2_matched, out2a)
         save_xlsx(s2_notin, out2b)
         
+        # Log activity
+        if current_user:
+            log_activity(
+                username=current_user.username,
+                bank_type=CURRENT_BANK_TYPE,
+                step_completed=2,
+                run_id=run_id,
+                row_counts={
+                    "matches": len(s2_matched),
+                    "not_in": len(s2_notin)
+                },
+                success=True
+            )
+        
         return {
             "status": "success",
             "run_id": run_id,
@@ -838,6 +937,18 @@ async def reconcile_step3(
         out3 = CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx"
         save_xlsx(s3, out3)
         
+        # Log activity
+        if current_user:
+            log_activity(
+                username=current_user.username,
+                bank_type=CURRENT_BANK_TYPE,
+                step_completed=3,
+                run_id=run_id,
+                tpa_name=tpa_name,
+                row_counts={"rows": len(s3)},
+                success=True
+            )
+        
         return {
             "status": "success",
             "run_id": run_id,
@@ -883,6 +994,47 @@ async def reconcile_step4(
         zip_path = CURRENT_RUN_DIR / f"{run_id}.zip"
         zip_outputs(all_outputs, zip_path)
         
+        # Collect comprehensive row counts from all steps
+        comprehensive_counts = {
+            "outstanding_matches": len(s4)
+        }
+        
+        # Try to get counts from previous steps
+        try:
+            # Step 1 counts
+            step1_bank = CURRENT_RUN_DIR / f"01a_{CURRENT_BANK_TYPE.lower()}_bank_clean.xlsx"
+            step1_adv = CURRENT_RUN_DIR / f"01b_{CURRENT_BANK_TYPE.lower()}_advance_clean.xlsx"
+            if step1_bank.exists():
+                comprehensive_counts["bank_rows"] = len(pd.read_excel(step1_bank, dtype=str))
+            if step1_adv.exists():
+                comprehensive_counts["advance_rows"] = len(pd.read_excel(step1_adv, dtype=str))
+            
+            # Step 2 counts
+            step2_match = CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx"
+            step2_notin = CURRENT_RUN_DIR / "02b_bank_not_in_advance.xlsx"
+            if step2_match.exists():
+                comprehensive_counts["bank_advance_matches"] = len(pd.read_excel(step2_match, dtype=str))
+            if step2_notin.exists():
+                comprehensive_counts["not_in_advance"] = len(pd.read_excel(step2_notin, dtype=str))
+            
+            # Step 3 counts
+            step3_mis = CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx"
+            if step3_mis.exists():
+                comprehensive_counts["mis_mapped"] = len(pd.read_excel(step3_mis, dtype=str))
+        except Exception as e:
+            print(f"[Step4] Warning: Could not collect all row counts: {e}")
+        
+        # Log activity - Step 4 completes the reconciliation
+        if current_user:
+            log_activity(
+                username=current_user.username,
+                bank_type=CURRENT_BANK_TYPE,
+                step_completed=4,
+                run_id=run_id,
+                row_counts=comprehensive_counts,
+                success=True
+            )
+        
         return {
             "status": "success",
             "run_id": run_id,
@@ -896,3 +1048,141 @@ async def reconcile_step4(
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+# ==================== USER PROFILE & ACTIVITY ENDPOINTS ====================
+
+@APP.get("/profile/stats", response_model=UserStatsResponse)
+async def get_user_stats(current_user: UserInDB = Depends(get_current_user)):
+    """Get user statistics and activity summary"""
+    if not AUTH_ENABLED or activity_logs_collection is None:
+        raise HTTPException(status_code=503, detail="Profile features not available")
+    
+    username = current_user.username
+    
+    # Get all activities for user
+    activities = list(activity_logs_collection.find(
+        {"username": username, "success": True},
+        {"_id": 0}
+    ).sort("timestamp", -1))
+    
+    if not activities:
+        return UserStatsResponse(
+            username=username,
+            total_reconciliations=0,
+            this_week=0,
+            this_month=0,
+            current_streak=0,
+            last_activity=None
+        )
+    
+    now = datetime.utcnow()
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+    
+    # Count reconciliations (step 4 completions)
+    completed = [a for a in activities if a.get("step_completed") == 4]
+    total = len(completed)
+    this_week = len([a for a in completed if a["timestamp"] >= week_ago])
+    this_month = len([a for a in completed if a["timestamp"] >= month_ago])
+    
+    # Calculate streak (consecutive days with at least 1 completion)
+    streak = 0
+    if completed:
+        sorted_dates = sorted(set(
+            a["timestamp"].date() for a in completed
+        ), reverse=True)
+        
+        yesterday = now.date() - timedelta(days=1)
+        today = now.date()
+        
+        # Start from today or yesterday
+        if sorted_dates and sorted_dates[0] in [today, yesterday]:
+            streak = 1
+            current_date = sorted_dates[0] - timedelta(days=1)
+            
+            for date in sorted_dates[1:]:
+                if date == current_date:
+                    streak += 1
+                    current_date -= timedelta(days=1)
+                else:
+                    break
+    
+    last_activity = activities[0]["timestamp"] if activities else None
+    
+    return UserStatsResponse(
+        username=username,
+        total_reconciliations=total,
+        this_week=this_week,
+        this_month=this_month,
+        current_streak=streak,
+        last_activity=last_activity
+    )
+
+@APP.get("/profile/activity", response_model=List[ActivityResponse])
+async def get_user_activity(
+    current_user: UserInDB = Depends(get_current_user),
+    limit: int = 10
+):
+    """Get recent completed reconciliations (Step 4 only)"""
+    if not AUTH_ENABLED or activity_logs_collection is None:
+        raise HTTPException(status_code=503, detail="Profile features not available")
+    
+    # Only return Step 4 completions (completed reconciliations)
+    activities = list(activity_logs_collection.find(
+        {
+            "username": current_user.username,
+            "step_completed": 4,
+            "success": True
+        },
+        {"_id": 0, "username": 0}
+    ).sort("timestamp", -1).limit(limit))
+    
+    return [ActivityResponse(**a) for a in activities]
+
+@APP.get("/profile/daily", response_model=List[DailyActivityResponse])
+async def get_daily_activity(
+    current_user: UserInDB = Depends(get_current_user),
+    days: int = 30
+):
+    """Get daily activity aggregation for charts"""
+    if not AUTH_ENABLED or activity_logs_collection is None:
+        raise HTTPException(status_code=503, detail="Profile features not available")
+    
+    start_date = datetime.utcnow() - timedelta(days=days)
+    
+    # Aggregate by date
+    pipeline = [
+        {
+            "$match": {
+                "username": current_user.username,
+                "timestamp": {"$gte": start_date},
+                "step_completed": 4,  # Only count completed reconciliations
+                "success": True
+            }
+        },
+        {
+            "$group": {
+                "_id": {
+                    "$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}
+                },
+                "count": {"$sum": 1}
+            }
+        },
+        {
+            "$sort": {"_id": 1}
+        }
+    ]
+    
+    results = list(activity_logs_collection.aggregate(pipeline))
+    
+    # Fill in missing dates with 0 count
+    date_counts = {r["_id"]: r["count"] for r in results}
+    all_dates = []
+    
+    for i in range(days):
+        date = (datetime.utcnow() - timedelta(days=days - i - 1)).strftime("%Y-%m-%d")
+        all_dates.append(DailyActivityResponse(
+            date=date,
+            count=date_counts.get(date, 0)
+        ))
+    
+    return all_dates
