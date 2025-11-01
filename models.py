@@ -39,7 +39,7 @@ class UserResponse(BaseModel):
     full_name: Optional[str] = None
     created_at: datetime
 
-# NEW: Activity Log Models
+# Activity Log Models
 class ActivityLog(BaseModel):
     """Model for tracking reconciliation activity"""
     username: str
@@ -78,3 +78,33 @@ class DailyActivityResponse(BaseModel):
     """Response model for daily activity aggregation"""
     date: str  # YYYY-MM-DD format
     count: int
+
+# NEW: Reconciliation Result Models
+class ReconciliationSummary(BaseModel):
+    """Summary stats for a reconciliation run"""
+    step1_bank_rows: int = 0
+    step1_advance_rows: int = 0
+    step2_matches: int = 0
+    step2_not_in: int = 0
+    step3_mis_mapped: int = 0
+    step4_outstanding: int = 0
+    total_amount: float = 0.0
+    unique_patients: int = 0
+
+class ReconciliationResult(BaseModel):
+    """Complete reconciliation result stored in MongoDB"""
+    username: str
+    run_id: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    bank_type: str  # "ICICI" or "AXIS"
+    tpa_name: Optional[str] = None
+    summary: ReconciliationSummary
+    zip_file_id: str  # GridFS file ID for the ZIP
+
+class ReconciliationHistoryResponse(BaseModel):
+    """Response for history list"""
+    run_id: str
+    timestamp: datetime
+    bank_type: str
+    tpa_name: Optional[str]
+    summary: ReconciliationSummary

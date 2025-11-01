@@ -22,9 +22,10 @@ try:
     )
     from models import (
         UserRegister, UserLogin, Token, UserResponse, UserInDB,
-        ActivityLog, UserStatsResponse, ActivityResponse, DailyActivityResponse
+        ActivityLog, UserStatsResponse, ActivityResponse, DailyActivityResponse,
+        ReconciliationHistoryResponse, ReconciliationSummary
     )
-    from database import users_collection, activity_logs_collection
+    from database import users_collection, activity_logs_collection, reconciliation_results_collection, fs
     AUTH_ENABLED = True
 except ImportError:
     print("[WARNING] Authentication modules not found. Running without authentication.")
@@ -166,7 +167,7 @@ def _norm(s):
 def _to_amt(x):
     try:
         s = str(x).replace(",", "").strip()
-        if s in ["", "-", "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â"]: return np.nan
+        if s in ["", "-", "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â"]: return np.nan
         if s.startswith("(") and s.endswith(")"): return -round(float(s[1:-1]), 2)
         return round(float(s), 2)
     except: return np.nan
@@ -396,7 +397,7 @@ def read_clean_axis_advance_xlsx(xlsx_path: Path) -> pd.DataFrame:
     df["Refer_No_UTR"] = df["UTR"].astype(str).str.strip().str.replace("^/XUTR/","",regex=True)
     return df
 
-# ---------- Step 2 (Bank ÃƒÆ’Ã¢â‚¬â€ Advance) ----------
+# ---------- Step 2 (Bank ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Advance) ----------
 def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
     if bank_df.empty:
         return pd.DataFrame(), bank_df
@@ -424,7 +425,7 @@ def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
         not_in = bank_df.loc[~bank_df["Description"].isin(matched["Description"])]
     return matched, not_in
 
-# ---------- Step 3 (to MIS) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â TPA-aware ----------
+# ---------- Step 3 (to MIS) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â TPA-aware ----------
 def step3_map_to_mis(step2_df: pd.DataFrame, mis_path: Path, tpa_name: str) -> pd.DataFrame:
     if step2_df.empty:
         return pd.DataFrame()
@@ -457,7 +458,7 @@ def step3_map_to_mis(step2_df: pd.DataFrame, mis_path: Path, tpa_name: str) -> p
     )
     return merged.drop_duplicates()
 
-# ---------- Outstanding Parser (header hunting + block headers Ã¢â€ â€™ 'Insurance Company Automated' + footer removal) ----------
+# ---------- Outstanding Parser (header hunting + block headers ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 'Insurance Company Automated' + footer removal) ----------
 
 # Only true per-block footer tokens (tight to avoid accidental drops)
 _FOOTER_TOKENS = ["SUB TOTAL", "SUBTOTAL", "TOTAL", "GRAND TOTAL"]
@@ -506,7 +507,7 @@ def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
     """
     Parse Outstanding Excel file with:
     - Header hunting (tolerant to position/typos)
-    - Block headers Ã¢â€ â€™ 'Insurance Company Automated' column
+    - Block headers ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 'Insurance Company Automated' column
     - Footer removal
     """
     # Read with no header; file is already ensured to be .xlsx by ensure_xlsx
@@ -518,10 +519,10 @@ def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
     header_norm = []
     for h in header_vals:
         hn = str(h).strip()
-        # Consulatnt Ã¢â€ â€™ Consultant (tolerant)
+        # Consulatnt ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Consultant (tolerant)
         if re.sub(r"[^A-Za-z]", "", hn).lower().startswith("consul"):
             hn = "Consultant"
-        # Insurance companies Ã¢â€ â€™ Insurance Company
+        # Insurance companies ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Insurance Company
         if hn.strip().lower() == "insurance companies":
             hn = "Insurance Company"
         header_norm.append(hn)
@@ -578,14 +579,14 @@ def step4_strict_matches(step3_df: pd.DataFrame, outstanding_path: Path) -> pd.D
     for col in ["Patient Name","CR No","Balance"]:
         if col not in out.columns:
             raise ValueError(f"Outstanding missing '{col}'.")
-    # ↓↓↓ UPDATED: only need Patient Name + Settled Amount in Step-3
+    # â†“â†“â†“ UPDATED: only need Patient Name + Settled Amount in Step-3
     for col in ["Patient Name","Settled Amount"]:
         if col not in step3_df.columns:
             raise ValueError(f"Step-3 missing '{col}'.")
     L = out.copy(); R = step3_df.copy()
     L["_PNORM"] = L["Patient Name"].apply(_norm)
     R["_PNORM"] = R["Patient Name"].apply(_norm)
-    # ↓↓↓ UPDATED: only merge on Patient Name (no CR No matching)
+    # â†“â†“â†“ UPDATED: only merge on Patient Name (no CR No matching)
     merged = L.merge(R, on=["_PNORM"], how="inner", suffixes=("_out","_m3"))
     bal  = merged["Balance"].apply(_to_amt)
     sett = merged["Settled Amount"].apply(_to_amt)
@@ -1024,6 +1025,64 @@ async def reconcile_step4(
         except Exception as e:
             print(f"[Step4] Warning: Could not collect all row counts: {e}")
         
+
+        # ✅ NEW: Save reconciliation result to MongoDB
+        if current_user and reconciliation_results_collection is not None and fs is not None:
+            try:
+                from bson import ObjectId
+                
+                # Read ZIP file and store in GridFS
+                with open(zip_path, "rb") as zip_file:
+                    zip_file_id = fs.put(
+                        zip_file,
+                        filename=f"{run_id}.zip",
+                        username=current_user.username,
+                        content_type="application/zip"
+                    )
+                
+                # Calculate summary
+                total_amount = 0.0
+                unique_patients = 0
+                if len(s4) > 0:
+                    if "Settled Amount" in s4.columns:
+                        total_amount = float(s4["Settled Amount"].apply(_to_amt).sum())
+                    if "Patient Name" in s4.columns:
+                        unique_patients = len(s4["Patient Name"].unique())
+                
+                # Get TPA name from Step 3 activity logs
+                last_activity = activity_logs_collection.find_one(
+                    {"username": current_user.username, "run_id": run_id, "step_completed": 3},
+                    sort=[("timestamp", -1)]
+                )
+                tpa_name = last_activity.get("tpa_name") if last_activity else None
+                
+                # Create result document
+                result_doc = {
+                    "username": current_user.username,
+                    "run_id": run_id,
+                    "timestamp": datetime.utcnow(),
+                    "bank_type": CURRENT_BANK_TYPE,
+                    "tpa_name": tpa_name,
+                    "summary": {
+                        "step1_bank_rows": comprehensive_counts.get("bank_rows", 0),
+                        "step1_advance_rows": comprehensive_counts.get("advance_rows", 0),
+                        "step2_matches": comprehensive_counts.get("bank_advance_matches", 0),
+                        "step2_not_in": comprehensive_counts.get("not_in_advance", 0),
+                        "step3_mis_mapped": comprehensive_counts.get("mis_mapped", 0),
+                        "step4_outstanding": len(s4),
+                        "total_amount": total_amount,
+                        "unique_patients": unique_patients
+                    },
+                    "zip_file_id": str(zip_file_id)
+                }
+                
+                reconciliation_results_collection.insert_one(result_doc)
+                print(f"[Step4] ✅ Saved reconciliation result to MongoDB: {run_id}")
+                
+            except Exception as e:
+                print(f"[Step4] ⚠️ Failed to save to MongoDB: {e}")
+                # Don't fail the request if storage fails
+        
         # Log activity - Step 4 completes the reconciliation
         if current_user:
             log_activity(
@@ -1186,3 +1245,129 @@ async def get_daily_activity(
         ))
     
     return all_dates
+# ==================== RECONCILIATION HISTORY ENDPOINTS ====================
+
+@APP.get("/reconciliations/history")
+async def get_reconciliation_history(
+    current_user: UserInDB = Depends(get_current_user),
+    limit: int = 50,
+    skip: int = 0
+):
+    """Get user's reconciliation history with download links"""
+    if reconciliation_results_collection is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    
+    results = list(reconciliation_results_collection.find(
+        {"username": current_user.username},
+        {"_id": 0}  # Exclude MongoDB _id
+    ).sort("timestamp", -1).skip(skip).limit(limit))
+    
+    return results
+
+@APP.get("/reconciliations/{run_id}/details")
+async def get_reconciliation_details(
+    run_id: str,
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """Get details of a specific reconciliation"""
+    if reconciliation_results_collection is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    
+    result = reconciliation_results_collection.find_one(
+        {
+            "username": current_user.username,
+            "run_id": run_id
+        },
+        {"_id": 0}
+    )
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="Reconciliation not found")
+    
+    return result
+
+@APP.get("/reconciliations/{run_id}/download-zip")
+async def download_reconciliation_zip(
+    run_id: str,
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """Download ZIP file from past reconciliation"""
+    if reconciliation_results_collection is None or fs is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    
+    # Find the reconciliation result
+    result = reconciliation_results_collection.find_one(
+        {
+            "username": current_user.username,
+            "run_id": run_id
+        }
+    )
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="Reconciliation not found")
+    
+    # Get ZIP file from GridFS
+    try:
+        zip_file_id = ObjectId(result["zip_file_id"])
+        zip_file = fs.get(zip_file_id)
+        
+        def file_iterator():
+            yield zip_file.read()
+        
+        return StreamingResponse(
+            file_iterator(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename={run_id}.zip",
+                "Content-Type": "application/zip"
+            }
+        )
+    except InvalidId:
+        raise HTTPException(status_code=404, detail="Invalid file ID")
+    except Exception as e:
+        print(f"[Download ZIP] Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve file")
+
+@APP.delete("/reconciliations/{run_id}")
+async def delete_reconciliation(
+    run_id: str,
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """Delete a reconciliation and its files"""
+    if reconciliation_results_collection is None or fs is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    
+    from bson import ObjectId
+    
+    # Find the reconciliation
+    result = reconciliation_results_collection.find_one(
+        {
+            "username": current_user.username,
+            "run_id": run_id
+        }
+    )
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="Reconciliation not found")
+    
+    try:
+        # Delete GridFS file
+        zip_file_id = ObjectId(result["zip_file_id"])
+        fs.delete(zip_file_id)
+        
+        # Delete reconciliation document
+        reconciliation_results_collection.delete_one(
+            {
+                "username": current_user.username,
+                "run_id": run_id
+            }
+        )
+        
+        print(f"[Delete] ✅ Deleted reconciliation: {run_id}")
+        return {"status": "success", "message": "Reconciliation deleted"}
+    except Exception as e:
+        print(f"[Delete] Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete reconciliation")

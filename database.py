@@ -1,6 +1,8 @@
 import os
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
+import gridfs
+from datetime import datetime, timedelta
 
 # Try to load .env for local development, but don't fail if it doesn't exist
 try:
@@ -21,6 +23,8 @@ if not MONGODB_URI:
     db = None
     users_collection = None
     activity_logs_collection = None
+    reconciliation_results_collection = None
+    fs = None
 else:
     # Database name
     DB_NAME = "recon_db"
@@ -39,7 +43,11 @@ else:
         
         db = client[DB_NAME]
         users_collection = db["users"]
-        activity_logs_collection = db["activity_logs"]  # NEW: Activity tracking
+        activity_logs_collection = db["activity_logs"]
+        reconciliation_results_collection = db["reconciliation_results"]  # NEW
+        
+        # Initialize GridFS for file storage
+        fs = gridfs.GridFS(db)  # NEW
         
         # Create unique index on username
         users_collection.create_index("username", unique=True)
@@ -49,9 +57,24 @@ else:
         activity_logs_collection.create_index("timestamp")
         activity_logs_collection.create_index([("username", 1), ("timestamp", -1)])
         
+        # Create indexes for reconciliation results (NEW)
+        reconciliation_results_collection.create_index("username")
+        reconciliation_results_collection.create_index("run_id", unique=True)
+        reconciliation_results_collection.create_index([("username", 1), ("timestamp", -1)])
+        
+        # Create TTL index to auto-delete reconciliations after 30 days (NEW)
+        reconciliation_results_collection.create_index(
+            "timestamp", 
+            expireAfterSeconds=30 * 24 * 60 * 60  # 30 days in seconds
+        )
+        print("[MongoDB] ✅ TTL index created: reconciliations auto-delete after 30 days")
+        
         print(f"[MongoDB] Database '{DB_NAME}' initialized with collections:")
         print(f"  - users")
         print(f"  - activity_logs")
+        print(f"  - reconciliation_results (TTL: 30 days)")
+        print(f"  - fs.files (GridFS)")
+        print(f"  - fs.chunks (GridFS)")
         
     except ConnectionFailure as e:
         print(f"[MongoDB] ❌ Connection failed: {e}")
@@ -59,9 +82,13 @@ else:
         db = None
         users_collection = None
         activity_logs_collection = None
+        reconciliation_results_collection = None
+        fs = None
     except Exception as e:
         print(f"[MongoDB] ❌ Unexpected error: {e}")
         client = None
         db = None
         users_collection = None
         activity_logs_collection = None
+        reconciliation_results_collection = None
+        fs = None
