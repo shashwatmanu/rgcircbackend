@@ -1249,6 +1249,66 @@ async def reconcile_step4(
         raise HTTPException(status_code=400, detail=str(e))
 # ==================== USER PROFILE & ACTIVITY ENDPOINTS ====================
 
+@APP.post("/auth/change-password")
+async def change_password(
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """
+    Change user's password
+    
+    Form Data:
+    - current_password: Current password for verification
+    - new_password: New password (min 6 chars)
+    """
+    if not AUTH_ENABLED or users_collection is None:
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+    
+    # Verify current password
+    from auth import verify_password, get_password_hash
+    
+    if not verify_password(current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Current password is incorrect"
+        )
+    
+    # Validate new password length
+    if len(new_password) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be at least 6 characters"
+        )
+    
+    # Hash and update password
+    try:
+        new_hashed_password = get_password_hash(new_password)
+        
+        result = users_collection.update_one(
+            {"username": current_user.username},
+            {"$set": {"hashed_password": new_hashed_password}}
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update password"
+            )
+        
+        print(f"[Password Change] ✅ Password updated for user: {current_user.username}")
+        
+        return {
+            "status": "success",
+            "message": "Password changed successfully"
+        }
+    except Exception as e:
+        print(f"[Password Change] Error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to change password: {str(e)}"
+        )
+
 @APP.get("/profile/stats", response_model=UserStatsResponse)
 async def get_user_stats(current_user: UserInDB = Depends(get_current_user)):
     """Get user statistics and activity summary"""
