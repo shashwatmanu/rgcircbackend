@@ -1,4 +1,4 @@
-import io, os, shutil, zipfile, re
+import io, os, shutil, zipfile, re, secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
@@ -23,7 +23,8 @@ try:
     from models import (
         UserRegister, UserLogin, Token, UserResponse, UserInDB,
         ActivityLog, UserStatsResponse, ActivityResponse, DailyActivityResponse,
-        ReconciliationHistoryResponse, ReconciliationSummary
+        ReconciliationHistoryResponse, ReconciliationSummary,
+        SendVerificationEmailRequest, VerifyEmailRequest
     )
     from database import users_collection, activity_logs_collection, reconciliation_results_collection, fs
     AUTH_ENABLED = True
@@ -31,6 +32,15 @@ except ImportError:
     print("[WARNING] Authentication modules not found. Running without authentication.")
     AUTH_ENABLED = False
     get_current_user = None
+
+# Try to import email utilities
+try:
+    from email_utils import send_verification_email
+    EMAIL_ENABLED = True
+    print("[Email] ✅ Email utilities loaded")
+except ImportError:
+    print("[Email] ⚠️ email_utils not found. Email verification disabled.")
+    EMAIL_ENABLED = False
 
 APP = FastAPI(title="Recon Backend v16.22 + Auth", version="1.0")
 
@@ -167,7 +177,7 @@ def _norm(s):
 def _to_amt(x):
     try:
         s = str(x).replace(",", "").strip()
-        if s in ["", "-", "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â"]: return np.nan
+        if s in ["", "-", "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â"]: return np.nan
         if s.startswith("(") and s.endswith(")"): return -round(float(s[1:-1]), 2)
         return round(float(s), 2)
     except: return np.nan
@@ -397,7 +407,7 @@ def read_clean_axis_advance_xlsx(xlsx_path: Path) -> pd.DataFrame:
     df["Refer_No_UTR"] = df["UTR"].astype(str).str.strip().str.replace("^/XUTR/","",regex=True)
     return df
 
-# ---------- Step 2 (Bank ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Advance) ----------
+# ---------- Step 2 (Bank ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Advance) ----------
 def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
     if bank_df.empty:
         return pd.DataFrame(), bank_df
@@ -425,7 +435,7 @@ def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
         not_in = bank_df.loc[~bank_df["Description"].isin(matched["Description"])]
     return matched, not_in
 
-# ---------- Step 3 (to MIS) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â TPA-aware ----------
+# ---------- Step 3 (to MIS) ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â TPA-aware ----------
 def step3_map_to_mis(step2_df: pd.DataFrame, mis_path: Path, tpa_name: str) -> pd.DataFrame:
     if step2_df.empty:
         return pd.DataFrame()
@@ -458,7 +468,7 @@ def step3_map_to_mis(step2_df: pd.DataFrame, mis_path: Path, tpa_name: str) -> p
     )
     return merged.drop_duplicates()
 
-# ---------- Outstanding Parser (header hunting + block headers ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 'Insurance Company Automated' + footer removal) ----------
+# ---------- Outstanding Parser (header hunting + block headers ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 'Insurance Company Automated' + footer removal) ----------
 
 # Only true per-block footer tokens (tight to avoid accidental drops)
 _FOOTER_TOKENS = ["SUB TOTAL", "SUBTOTAL", "TOTAL", "GRAND TOTAL"]
@@ -507,7 +517,7 @@ def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
     """
     Parse Outstanding Excel file with:
     - Header hunting (tolerant to position/typos)
-    - Block headers ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 'Insurance Company Automated' column
+    - Block headers ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 'Insurance Company Automated' column
     - Footer removal
     """
     # Read with no header; file is already ensured to be .xlsx by ensure_xlsx
@@ -519,10 +529,10 @@ def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
     header_norm = []
     for h in header_vals:
         hn = str(h).strip()
-        # Consulatnt ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Consultant (tolerant)
+        # Consulatnt ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ Consultant (tolerant)
         if re.sub(r"[^A-Za-z]", "", hn).lower().startswith("consul"):
             hn = "Consultant"
-        # Insurance companies ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Insurance Company
+        # Insurance companies ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ Insurance Company
         if hn.strip().lower() == "insurance companies":
             hn = "Insurance Company"
         header_norm.append(hn)
@@ -579,14 +589,14 @@ def step4_strict_matches(step3_df: pd.DataFrame, outstanding_path: Path) -> pd.D
     for col in ["Patient Name","CR No","Balance"]:
         if col not in out.columns:
             raise ValueError(f"Outstanding missing '{col}'.")
-    # â†“â†“â†“ UPDATED: only need Patient Name + Settled Amount in Step-3
+    # Ã¢â€ â€œÃ¢â€ â€œÃ¢â€ â€œ UPDATED: only need Patient Name + Settled Amount in Step-3
     for col in ["Patient Name","Settled Amount"]:
         if col not in step3_df.columns:
             raise ValueError(f"Step-3 missing '{col}'.")
     L = out.copy(); R = step3_df.copy()
     L["_PNORM"] = L["Patient Name"].apply(_norm)
     R["_PNORM"] = R["Patient Name"].apply(_norm)
-    # â†“â†“â†“ UPDATED: only merge on Patient Name (no CR No matching)
+    # Ã¢â€ â€œÃ¢â€ â€œÃ¢â€ â€œ UPDATED: only merge on Patient Name (no CR No matching)
     merged = L.merge(R, on=["_PNORM"], how="inner", suffixes=("_out","_m3"))
     bal  = merged["Balance"].apply(_to_amt)
     sett = merged["Settled Amount"].apply(_to_amt)
@@ -634,7 +644,10 @@ async def register(user: UserRegister):
         "full_name": user.full_name,
         "hashed_password": get_password_hash(user.password),
         "created_at": datetime.utcnow(),
-        "is_active": True
+        "is_active": True,
+        "email_verified": False,
+        "verification_token": None,
+        "verification_token_expires": None
     }
     
     try:
@@ -645,7 +658,8 @@ async def register(user: UserRegister):
             username=user_dict["username"],
             email=user_dict.get("email"),
             full_name=user_dict.get("full_name"),
-            created_at=user_dict["created_at"]
+            created_at=user_dict["created_at"],
+            email_verified=user_dict.get("email_verified", False)
         )
     except Exception as e:
         raise HTTPException(
@@ -708,8 +722,134 @@ async def get_current_user_info(current_user: UserInDB = Depends(get_current_use
         username=current_user.username,
         email=current_user.email,
         full_name=current_user.full_name,
-        created_at=current_user.created_at
+        created_at=current_user.created_at,
+        email_verified=current_user.email_verified
     )
+
+@APP.post("/auth/send-verification-email")
+async def send_verification_email_endpoint(
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """Send email verification email to current user"""
+    if not AUTH_ENABLED or users_collection is None:
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+    
+    if not current_user.email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No email address associated with this account"
+        )
+    
+    if current_user.email_verified:
+        return {
+            "status": "already_verified",
+            "message": "Email already verified"
+        }
+    
+    # Generate verification token
+    verification_token = secrets.token_urlsafe(32)
+    token_expires = datetime.utcnow() + timedelta(hours=24)
+    
+    # Update user with verification token
+    users_collection.update_one(
+        {"username": current_user.username},
+        {
+            "$set": {
+                "verification_token": verification_token,
+                "verification_token_expires": token_expires
+            }
+        }
+    )
+    
+    # Generate verification URL
+    frontend_url = os.getenv("FRONTEND_URL", "https://recondb.vercel.app")
+    verification_url = f"{frontend_url}/auth/verify-email?token={verification_token}"
+    
+    print(f"[Email Verification] Token: {verification_token}")
+    print(f"[Email Verification] URL: {verification_url}")
+    
+    # Try to send email
+    if EMAIL_ENABLED:
+        email_sent = send_verification_email(
+            to_email=current_user.email,
+            username=current_user.username,
+            verification_url=verification_url
+        )
+        
+        if email_sent:
+            return {
+                "status": "success",
+                "message": f"Verification email sent to {current_user.email}",
+                "expires_in_hours": 24
+            }
+    
+    # Email not sent but token saved
+    return {
+        "status": "partial_success",
+        "message": "Verification token generated but email could not be sent",
+        "verification_url": verification_url,  # For testing
+        "expires_in_hours": 24
+    }
+
+
+@APP.post("/auth/verify-email")
+async def verify_email_with_token(token: str = Form(...)):
+    """Verify user email with token"""
+    if not AUTH_ENABLED or users_collection is None:
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+    
+    # Find user with this token
+    user = users_collection.find_one({"verification_token": token})
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired verification token"
+        )
+    
+    # Check if expired
+    if user.get("verification_token_expires"):
+        if datetime.utcnow() > user["verification_token_expires"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Verification token has expired"
+            )
+    
+    # Mark verified
+    users_collection.update_one(
+        {"username": user["username"]},
+        {
+            "$set": {"email_verified": True},
+            "$unset": {
+                "verification_token": "",
+                "verification_token_expires": ""
+            }
+        }
+    )
+    
+    print(f"[Email Verification] ✅ Verified: {user['username']}")
+    
+    return {
+        "status": "success",
+        "message": "Email verified successfully!",
+        "username": user["username"]
+    }
+
+
+@APP.get("/auth/verification-status")
+async def get_verification_status(
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """Get verification status"""
+    if not AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+    
+    return {
+        "username": current_user.username,
+        "email": current_user.email,
+        "email_verified": current_user.email_verified,
+        "has_email": bool(current_user.email)
+    }
 
 # ==================== PROTECTED ENDPOINTS ====================
 # All reconciliation endpoints now require authentication
@@ -1026,7 +1166,7 @@ async def reconcile_step4(
             print(f"[Step4] Warning: Could not collect all row counts: {e}")
         
 
-        # ✅ NEW: Save reconciliation result to MongoDB
+        # âœ… NEW: Save reconciliation result to MongoDB
         if current_user and reconciliation_results_collection is not None and fs is not None:
             try:
                 from bson import ObjectId
@@ -1077,10 +1217,10 @@ async def reconcile_step4(
                 }
                 
                 reconciliation_results_collection.insert_one(result_doc)
-                print(f"[Step4] ✅ Saved reconciliation result to MongoDB: {run_id}")
+                print(f"[Step4] âœ… Saved reconciliation result to MongoDB: {run_id}")
                 
             except Exception as e:
-                print(f"[Step4] ⚠️ Failed to save to MongoDB: {e}")
+                print(f"[Step4] âš ï¸ Failed to save to MongoDB: {e}")
                 # Don't fail the request if storage fails
         
         # Log activity - Step 4 completes the reconciliation
@@ -1366,7 +1506,7 @@ async def delete_reconciliation(
             }
         )
         
-        print(f"[Delete] ✅ Deleted reconciliation: {run_id}")
+        print(f"[Delete] âœ… Deleted reconciliation: {run_id}")
         return {"status": "success", "message": "Reconciliation deleted"}
     except Exception as e:
         print(f"[Delete] Error: {e}")

@@ -1,11 +1,11 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, EmailStr
 from typing import Optional, Dict, List
 from datetime import datetime
 
 class UserRegister(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None
     full_name: Optional[str] = None
     
     @validator('username')
@@ -17,6 +17,27 @@ class UserRegister(BaseModel):
 class UserLogin(BaseModel):
     username: str
     password: str
+
+class UserUpdateRequest(BaseModel):
+    """Model for updating user profile"""
+    email: Optional[EmailStr] = None
+    full_name: Optional[str] = None
+    current_password: Optional[str] = None
+    new_password: Optional[str] = Field(None, min_length=6)
+    
+    @validator('new_password')
+    def validate_password_change(cls, v, values):
+        if v and not values.get('current_password'):
+            raise ValueError('Current password is required to change password')
+        return v
+
+class SendVerificationEmailRequest(BaseModel):
+    """Request model for sending verification email"""
+    pass  # No fields needed - uses current user from token
+
+class VerifyEmailRequest(BaseModel):
+    """Request model for verifying email with token"""
+    token: str = Field(..., min_length=32)
 
 class Token(BaseModel):
     access_token: str
@@ -32,12 +53,16 @@ class UserInDB(BaseModel):
     hashed_password: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
     is_active: bool = True
+    email_verified: bool = False
+    verification_token: Optional[str] = None
+    verification_token_expires: Optional[datetime] = None
 
 class UserResponse(BaseModel):
     username: str
     email: Optional[str] = None
     full_name: Optional[str] = None
     created_at: datetime
+    email_verified: bool = False
 
 # Activity Log Models
 class ActivityLog(BaseModel):
@@ -79,7 +104,7 @@ class DailyActivityResponse(BaseModel):
     date: str  # YYYY-MM-DD format
     count: int
 
-# NEW: Reconciliation Result Models
+# Reconciliation Result Models
 class ReconciliationSummary(BaseModel):
     """Summary stats for a reconciliation run"""
     step1_bank_rows: int = 0
