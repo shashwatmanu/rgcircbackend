@@ -46,7 +46,7 @@ APP = FastAPI(title="Recon Backend v16.22 + Auth", version="1.0")
 
 ALLOWED_ORIGINS = os.getenv(
     "CORS_ALLOW_ORIGINS",
-    "http://localhost:3000,https://recondb.vercel.app"
+    "http://localhost:3000,https://recondb.vercel.app,https://www.recowiz.in/"
 ).split(",")
 
 APP.add_middleware(

@@ -7,8 +7,9 @@ from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-# Suppress bcrypt version warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="passlib")
+# Suppress bcrypt warnings completely
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*bcrypt.*")
 
 # Try to load .env for local development
 try:
@@ -29,12 +30,10 @@ if not SECRET_KEY:
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
-# Password hashing with improved bcrypt configuration
+# Password hashing with bcrypt - simplified configuration
 pwd_context = CryptContext(
     schemes=["bcrypt"],
-    deprecated="auto",
-    bcrypt__rounds=12,  # Explicitly set rounds
-    bcrypt__ident="2b"   # Use bcrypt 2b variant
+    deprecated="auto"
 )
 
 # Bearer token scheme
@@ -45,11 +44,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
         # Bcrypt has a 72 byte limit - truncate if necessary
         if len(plain_password.encode('utf-8')) > 72:
-            print(f"[Auth] Warning: Password truncated to 72 bytes for bcrypt")
             plain_password = plain_password[:72]
         
         result = pwd_context.verify(plain_password, hashed_password)
-        print(f"[Auth] Password verification: {'✓ Success' if result else '✗ Failed'}")
         return result
     except Exception as e:
         print(f"[Auth] Password verification error: {e}")
@@ -60,7 +57,6 @@ def get_password_hash(password: str) -> str:
     try:
         # Bcrypt has a 72 byte limit - truncate if necessary
         if len(password.encode('utf-8')) > 72:
-            print(f"[Auth] Warning: Password truncated to 72 bytes for bcrypt")
             password = password[:72]
         
         hashed = pwd_context.hash(password)
@@ -83,11 +79,14 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 def get_user_from_db(username: str) -> Optional[UserInDB]:
-    """Get user from database by username"""
+    """Get user from database by username (case-insensitive)"""
     if users_collection is None:
         return None
     
-    user_doc = users_collection.find_one({"username": username})
+    # Normalize username to lowercase for lookup
+    username_lower = username.lower().strip()
+    
+    user_doc = users_collection.find_one({"username": username_lower})
     if user_doc:
         return UserInDB(**user_doc)
     return None
@@ -96,9 +95,12 @@ def authenticate_user(username: str, password: str) -> Optional[UserInDB]:
     """Authenticate user with username and password"""
     print(f"[Auth] Attempting to authenticate user: {username}")
     
-    user = get_user_from_db(username)
+    # Normalize username for lookup
+    username_lower = username.lower().strip()
+    
+    user = get_user_from_db(username_lower)
     if not user:
-        print(f"[Auth] User not found: {username}")
+        print(f"[Auth] User not found: {username} (searched as: {username_lower})")
         return None
     
     print(f"[Auth] User found, verifying password...")
@@ -106,7 +108,7 @@ def authenticate_user(username: str, password: str) -> Optional[UserInDB]:
         print(f"[Auth] Password verification failed for user: {username}")
         return None
     
-    print(f"[Auth] ✓ Authentication successful for user: {username}")
+    print(f"[Auth] ✅ Authentication successful for user: {username}")
     return user
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> UserInDB:
