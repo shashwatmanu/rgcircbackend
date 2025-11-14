@@ -44,17 +44,24 @@ except ImportError:
 
 APP = FastAPI(title="Recon Backend v16.22 + Auth", version="1.0")
 
+# Enhanced CORS configuration with explicit origins
 ALLOWED_ORIGINS = os.getenv(
     "CORS_ALLOW_ORIGINS",
-    "http://localhost:3000,https://recondb.vercel.app,https://www.recowiz.in"
+    "http://localhost:3000,https://recondb.vercel.app,https://www.recowiz.in,http://www.recowiz.in"
 ).split(",")
+
+# Clean and validate origins
+cleaned_origins = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
+print(f"[CORS] Allowed origins: {cleaned_origins}")
 
 APP.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
+    allow_origins=cleaned_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,  # Cache preflight requests for 1 hour
 )
 
 BASE_DIR = Path.cwd()
@@ -607,8 +614,26 @@ def step4_strict_matches(step3_df: pd.DataFrame, outstanding_path: Path) -> pd.D
 
 @APP.get("/")
 async def root():
-    """Health check endpoint"""
-    return {"status": "ok", "version": "16.22+auth", "auth_enabled": AUTH_ENABLED}
+    """Health check endpoint with CORS headers"""
+    return {
+        "status": "ok", 
+        "version": "16.22+auth", 
+        "auth_enabled": AUTH_ENABLED,
+        "cors_origins": cleaned_origins
+    }
+
+@APP.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str):
+    """Handle OPTIONS preflight requests explicitly"""
+    return JSONResponse(
+        content={"status": "ok"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "true",
+        }
+    )
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
 
@@ -684,6 +709,7 @@ async def login(
     - token_type: "bearer"
     """
     print(f"[Login] Received login request for username: {username}")
+    print(f"[CORS] Login endpoint - CORS headers should be automatically added")
     
     if not AUTH_ENABLED:
         raise HTTPException(status_code=503, detail="Authentication is not configured")
