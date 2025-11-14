@@ -54,9 +54,13 @@ ALLOWED_ORIGINS = os.getenv(
 cleaned_origins = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
 print(f"[CORS] Allowed origins: {cleaned_origins}")
 
+# Add wildcard to origins list for troubleshooting
+# In production, you should restrict to specific domains only
+all_origins = cleaned_origins + ["*"]
+
 APP.add_middleware(
     CORSMiddleware,
-    allow_origins=cleaned_origins,
+    allow_origins=["*"],  # Temporarily allow all origins for debugging
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
@@ -621,19 +625,6 @@ async def root():
         "auth_enabled": AUTH_ENABLED,
         "cors_origins": cleaned_origins
     }
-
-@APP.options("/{rest_of_path:path}")
-async def preflight_handler(rest_of_path: str):
-    """Handle OPTIONS preflight requests explicitly"""
-    return JSONResponse(
-        content={"status": "ok"},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Credentials": "true",
-        }
-    )
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
 
