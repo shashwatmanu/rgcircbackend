@@ -62,17 +62,25 @@ else:
         reconciliation_results_collection.create_index("run_id", unique=True)
         reconciliation_results_collection.create_index([("username", 1), ("timestamp", -1)])
         
-        # Create TTL index to auto-delete reconciliations after 30 days (NEW)
+        # Ensure TTL index reflects desired retention policy (40 days)
+        TTL_SECONDS = 40 * 24 * 60 * 60
+        existing_indexes = reconciliation_results_collection.index_information()
+        timestamp_index = existing_indexes.get("timestamp_1")
+        if timestamp_index:
+            existing_ttl = timestamp_index.get("expireAfterSeconds")
+            if existing_ttl != TTL_SECONDS:
+                reconciliation_results_collection.drop_index("timestamp_1")
+                print(f"[MongoDB] Dropped stale TTL index (had {existing_ttl}s, want {TTL_SECONDS}s)")
         reconciliation_results_collection.create_index(
-            "timestamp", 
-            expireAfterSeconds=30 * 24 * 60 * 60  # 30 days in seconds
+            "timestamp",
+            expireAfterSeconds=TTL_SECONDS
         )
-        print("[MongoDB] ✅ TTL index created: reconciliations auto-delete after 30 days")
+        print(f"[MongoDB] ✅ TTL index set to auto-delete after {TTL_SECONDS // (24 * 60 * 60)} days")
         
         print(f"[MongoDB] Database '{DB_NAME}' initialized with collections:")
         print(f"  - users")
         print(f"  - activity_logs")
-        print(f"  - reconciliation_results (TTL: 30 days)")
+        print(f"  - reconciliation_results (TTL: 40 days)")
         print(f"  - fs.files (GridFS)")
         print(f"  - fs.chunks (GridFS)")
         
