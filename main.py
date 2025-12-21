@@ -98,17 +98,21 @@ TPA_MIS_MAPS = {
         "Cheque/ NEFT/ UTR No.": "UTR_NO",
         "Claim No": "Claim Number"
     },
-    "PARK MEDICLAIM INSURANCE TPA PRIVATE LIMITED": {
-        "Cheque/ NEFT/ UTR No.": "Chq No",
-        "Claim No": "Claim Number"
-    },
-    "SAFEWAY INSURANCE TPA PVT.LTD": {
-        "Cheque/ NEFT/ UTR No.": "'Chequeno",
-        "Claim No": "Claim Number"
-    },
     "STAR HEALTH & ALLIED HEALTH INSURANCE CO.LTD.": {
         "Cheque/ NEFT/ UTR No.": "UTR",
         "Claim No": "Claim ID"
+    },
+    "ADITYA BIRLA": {
+        "Cheque/ NEFT/ UTR No.": "UTR Number",
+        "Claim No": "Claim Number"
+    },
+    "FHPL": {
+        "Cheque/ NEFT/ UTR No.": "Cheque/NEFT No",
+        "Claim No": "Claim Id"
+    },
+    "GOOD HEALTH": {
+        "Cheque/ NEFT/ UTR No.": "TRASACTION_NO",
+        "Claim No": "CCN_NO"
     },
     "VOLO HEALTH INSURANCE TPA PVT.LTD (EWA) (Mail Extract)": {
         "Cheque/ NEFT/ UTR No.": "UTR Number",
