@@ -40,7 +40,7 @@ except ImportError:
     print("[Email] ⚠️ email_utils not found. Email verification disabled.")
     EMAIL_ENABLED = False
 
-APP = FastAPI(title="Recon Backend v17.9 (Restored Full)", version="1.9")
+APP = FastAPI(title="Recon Backend v17.10 (Duplicate Header Fix)", version="1.10")
 
 # ==========================================
 #  CORS CONFIGURATION
@@ -155,6 +155,8 @@ def clean_raw_bank_statement_icici(path):
             for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
         df = df.iloc[:, :len(header_vals)]
         df.columns = header_vals
+        # FIX: Drop duplicate columns immediately to prevent DataFrame/Series confusion
+        df = df.loc[:, ~df.columns.duplicated()]
         return df
 
     path = Path(path)
@@ -212,9 +214,12 @@ def clean_raw_bank_statement_axis(path):
         header_vals = [str(x).strip() for x in raw.iloc[header_row_idx].tolist()]
         df = raw.iloc[header_row_idx + 1:].copy()
         if df.shape[1] < len(header_vals):
-            for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
+            for _ in range(len(header_vals) - df.shape[1]):
+                df[df.shape[1]] = np.nan
         df = df.iloc[:, :len(header_vals)]
         df.columns = header_vals
+        # FIX: Drop duplicate columns immediately to prevent DataFrame/Series confusion
+        df = df.loc[:, ~df.columns.duplicated()]
         return df
 
     path = Path(path)
@@ -282,6 +287,8 @@ def read_clean_icici_advance_excel(xlsx_path: Path, deduplicate: bool = True) ->
             for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
         df = df.iloc[:, :len(header_vals)]
         df.columns = header_vals
+        # FIX: Drop duplicate columns
+        df = df.loc[:, ~df.columns.duplicated()]
         return df
 
     path = Path(xlsx_path)
@@ -341,6 +348,8 @@ def read_clean_axis_advance_excel(x_path, deduplicate: bool = True) -> pd.DataFr
             for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
         df = df.iloc[:, :len(header_vals)]
         df.columns = header_vals
+        # FIX: Drop duplicate columns
+        df = df.loc[:, ~df.columns.duplicated()]
         return df
 
     path = Path(x_path)
@@ -410,6 +419,7 @@ def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
     for msg in keys:
         s = msg.strip()
         if not s: continue
+        # This check confirms we are searching in a Series, not a DataFrame
         m = bank_df[col_to_search].astype(str).str.contains(s, regex=False, na=False)
         if m.any():
             t = bank_df.loc[m].copy()
@@ -456,6 +466,8 @@ def parse_mis_universal(mis_path, tpa_name: str, empty_threshold: float = 0.5) -
             for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
         df = df.iloc[:, :len(header_vals)]
         df.columns = header_vals
+        # FIX: Drop duplicates
+        df = df.loc[:, ~df.columns.duplicated()]
         return df.dropna(how="all").reset_index(drop=True)
 
     tables = []
@@ -464,7 +476,7 @@ def parse_mis_universal(mis_path, tpa_name: str, empty_threshold: float = 0.5) -
         for sh in xls.sheet_names:
             tbl = _extract_from_sheet(xls.parse(sh, header=None, dtype=str))
             if tbl is not None: tables.append(tbl)
-    except:
+    except Exception as e:
         try:
             tbl = _extract_from_sheet(pd.read_csv(mis_path, header=None, dtype=str))
             if tbl is not None: tables.append(tbl)
@@ -531,6 +543,8 @@ def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
         for _ in range(len(header_norm) - df.shape[1]): df[df.shape[1]] = ""
     df = df.iloc[:, :len(header_norm)]
     df.columns = header_norm
+    # FIX: Drop duplicate columns
+    df = df.loc[:, ~df.columns.duplicated()]
 
     ent_col, current_entity, header_rows = [], "", []
     for idx, row in df.iterrows():
@@ -606,7 +620,7 @@ def log_activity(username, bank_type, step, run_id, duration=None, counts=None, 
 
 @APP.get("/")
 async def root():
-    return {"status": "ok", "version": "17.9+ExcelCore+Auth", "auth_enabled": AUTH_ENABLED}
+    return {"status": "ok", "version": "17.10+ExcelCore+Auth+DupFix", "auth_enabled": AUTH_ENABLED}
 
 @APP.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(user: UserRegister):
@@ -648,7 +662,6 @@ async def get_current_user_info(current_user: UserInDB = Depends(get_current_use
         email_verified=current_user.email_verified
     )
 
-# ✅ RESTORED: Verification Status Endpoint
 @APP.get("/auth/verification-status")
 async def get_verification_status(current_user: UserInDB = Depends(get_current_user)):
     if not AUTH_ENABLED: raise HTTPException(503, "Authentication is not configured")
@@ -766,7 +779,6 @@ async def get_reconciliation_history(current_user: UserInDB = Depends(get_curren
 
     return results
 
-# ✅ RESTORED: Details Endpoint
 @APP.get("/reconciliations/{run_id}/details")
 async def get_reconciliation_details(run_id: str, current_user: UserInDB = Depends(get_current_user)):
     if reconciliation_results_collection is None: raise HTTPException(503, "DB unavailable")
@@ -774,7 +786,6 @@ async def get_reconciliation_details(run_id: str, current_user: UserInDB = Depen
     if not res: raise HTTPException(404, "Reconciliation not found")
     return res
 
-# ✅ RESTORED: Download ZIP Endpoint
 @APP.get("/reconciliations/{run_id}/download-zip")
 async def download_reconciliation_zip(run_id: str, current_user: UserInDB = Depends(get_current_user)):
     if reconciliation_results_collection is None or fs is None: raise HTTPException(503, "DB unavailable")
@@ -833,7 +844,6 @@ async def reconcile_step1(
         CURRENT_BANK_TYPE = bank_type
         run_id = CURRENT_RUN_DIR.name
 
-        # ✅ RESTORED: Standardized Naming
         bank_path = CURRENT_RUN_DIR / "bank.xlsx"
         with open(bank_path, "wb") as f: f.write(await bank_file.read())
         
@@ -865,6 +875,8 @@ async def reconcile_step1(
             }
         }
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(400, detail=str(e))
 
 @APP.post("/reconcile/step2")
@@ -875,7 +887,6 @@ async def reconcile_step2(current_user: UserInDB = Depends(get_current_user) if 
     try:
         run_id = CURRENT_RUN_DIR.name
         
-        # ✅ RESTORED: Dynamic path selection based on type
         if CURRENT_BANK_TYPE == "ICICI":
             bank_path = CURRENT_RUN_DIR / "01a_icici_bank_clean.xlsx"
             adv_path = CURRENT_RUN_DIR / "01b_icici_advance_clean.xlsx"
@@ -919,7 +930,7 @@ async def reconcile_step3(
     if not CURRENT_RUN_DIR: raise HTTPException(400, "Run not initialized")
     try:
         run_id = CURRENT_RUN_DIR.name
-        mis_path = CURRENT_RUN_DIR / "mis.xlsx" # Standardized
+        mis_path = CURRENT_RUN_DIR / "mis.xlsx"
         with open(mis_path, "wb") as f: f.write(await mis_file.read())
         
         # 1. Clean MIS (New Logic)
@@ -927,12 +938,12 @@ async def reconcile_step3(
         out_mis_clean = save_xlsx(mis_clean, CURRENT_RUN_DIR / "04_mis_cleaned.xlsx")
         
         # 2. Map Step 2 Matches to MIS
-        s2_path = CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx" # Correct path
+        s2_path = CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx"
         if not s2_path.exists(): raise HTTPException(400, "Step 2 output missing")
         
         s2_df = pd.read_excel(s2_path, dtype=str)
         s3_mapped = step3_map_to_mis(s2_df, mis_clean, tpa_name, deduplicate=True)
-        out3 = save_xlsx(s3_mapped, CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx") # Standardized name
+        out3 = save_xlsx(s3_mapped, CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx")
         
         if current_user:
             log_activity(current_user.username, CURRENT_BANK_TYPE, 3, run_id, tpa=tpa_name, counts={"mapped": len(s3_mapped)})
@@ -958,7 +969,7 @@ async def reconcile_step4(
     if not CURRENT_RUN_DIR: raise HTTPException(400, "Run not initialized")
     try:
         run_id = CURRENT_RUN_DIR.name
-        out_path = CURRENT_RUN_DIR / "outstanding.xlsx" # Standardized
+        out_path = CURRENT_RUN_DIR / "outstanding.xlsx"
         with open(out_path, "wb") as f: f.write(await outstanding_file.read())
         
         # 1. Clean Outstanding
@@ -972,7 +983,7 @@ async def reconcile_step4(
         s3_df = pd.read_excel(s3_path, dtype=str)
         final_matched, final_unmatched = step4_strict_matches(s3_df, out_path, deduplicate=True)
         
-        out_final = save_xlsx(final_matched, CURRENT_RUN_DIR / "04_outstanding_matches.xlsx") # Standardized name
+        out_final = save_xlsx(final_matched, CURRENT_RUN_DIR / "04_outstanding_matches.xlsx")
         out_unmatched = save_xlsx(final_unmatched, CURRENT_RUN_DIR / "07b_final_unmatched_in_outstanding.xlsx")
         
         # Zip all outputs
@@ -980,7 +991,7 @@ async def reconcile_step4(
         zip_path = CURRENT_RUN_DIR / f"{run_id}.zip"
         zip_outputs(all_outputs, zip_path)
         
-        # --- DB STORAGE LOGIC (Aligned & Safe) ---
+        # --- DB STORAGE LOGIC ---
         if current_user and reconciliation_results_collection is not None and fs is not None:
             try:
                 with open(zip_path, "rb") as zf:
@@ -1001,7 +1012,6 @@ async def reconcile_step4(
                 elif "Amount" in final_matched.columns:
                     total_amount = final_matched["Amount"].apply(_to_amt).sum()
                 
-                # ✅ RESTORED: Detailed counts for History
                 comp_counts = {"step4_outstanding": len(final_matched)}
                 try:
                     # Step 1
@@ -1009,13 +1019,11 @@ async def reconcile_step4(
                     s1a = CURRENT_RUN_DIR / (f"01b_{CURRENT_BANK_TYPE.lower()}_advance_clean.xlsx")
                     if s1b.exists(): comp_counts["step1_bank_rows"] = len(pd.read_excel(s1b))
                     if s1a.exists(): comp_counts["step1_advance_rows"] = len(pd.read_excel(s1a))
-                    
                     # Step 2
                     s2_match = CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx"
                     s2_notin = CURRENT_RUN_DIR / "02b_bank_not_in_advance.xlsx"
                     if s2_match.exists(): comp_counts["step2_matches"] = len(pd.read_excel(s2_match))
                     if s2_notin.exists(): comp_counts["step2_not_in"] = len(pd.read_excel(s2_notin))
-                    
                     # Step 3
                     s3_mis = CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx"
                     if s3_mis.exists(): comp_counts["step3_mis_mapped"] = len(pd.read_excel(s3_mis))
