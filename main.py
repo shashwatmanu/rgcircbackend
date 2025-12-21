@@ -1,17 +1,17 @@
 import io, os, shutil, zipfile, re, secrets
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 import numpy as np
 import pandas as pd
-import pdfplumber
-import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Import authentication (we'll create these files)
+# ==========================================
+#  AUTHENTICATION SETUP
+# ==========================================
 try:
     from auth import (
         get_current_user, 
@@ -33,39 +33,31 @@ except ImportError:
     AUTH_ENABLED = False
     get_current_user = None
 
-# Try to import email utilities
 try:
     from email_utils import send_verification_email
     EMAIL_ENABLED = True
-    print("[Email] ✅ Email utilities loaded")
 except ImportError:
     print("[Email] ⚠️ email_utils not found. Email verification disabled.")
     EMAIL_ENABLED = False
 
-APP = FastAPI(title="Recon Backend v16.22 + Auth", version="1.0")
+APP = FastAPI(title="Recon Backend v17.9 (Restored Full)", version="1.9")
 
-# Enhanced CORS configuration with explicit origins
+# ==========================================
+#  CORS CONFIGURATION
+# ==========================================
 ALLOWED_ORIGINS = os.getenv(
     "CORS_ALLOW_ORIGINS",
     "http://localhost:3000,https://recondb.vercel.app,https://www.recowiz.in,http://www.recowiz.in"
 ).split(",")
 
-# Clean and validate origins
-cleaned_origins = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
-print(f"[CORS] Allowed origins: {cleaned_origins}")
-
-# Add wildcard to origins list for troubleshooting
-# In production, you should restrict to specific domains only
-all_origins = cleaned_origins + ["*"]
-
 APP.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Temporarily allow all origins for debugging
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
-    max_age=3600,  # Cache preflight requests for 1 hour
+    max_age=3600,
 )
 
 BASE_DIR = Path.cwd()
@@ -75,123 +67,513 @@ RUN_ROOT.mkdir(parents=True, exist_ok=True)
 CURRENT_RUN_DIR: Optional[Path] = None
 CURRENT_BANK_TYPE: Optional[str] = None
 
-# ---------- TPA Registry ----------
-TPA_CHOICES = [
-    "IHX (Original MIS)",
-    "CARE HEALTH INSURANCE LIMITED",
-    "HEALTH INDIA INSURANCE TPA SERVICES PRIVATE LTD.",
-    "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED",
-    "MEDSAVE HEALTHCARE TPA PVT LTD",
-    "PARAMOUNT HEALTHCARE",
-    "PARK MEDICLAIM INSURANCE TPA PRIVATE LIMITED",
-    "SAFEWAY INSURANCE TPA PVT.LTD",
-    "STAR HEALTH & ALLIED HEALTH INSURANCE CO.LTD.",
-    "VOLO HEALTH INSURANCE TPA PVT.LTD (EWA) (Mail Extract)"
-]
+# ==========================================
+#  PART 1: CONFIG & REGISTRY
+# ==========================================
 
-CANON_COLS = ["Cheque/ NEFT/ UTR No.", "Patient Name", "Settled Amount"]
+CANON_COLS = ["Cheque/ NEFT/ UTR No.", "Claim No"]
 
 TPA_MIS_MAPS = {
     "IHX (Original MIS)": {
         "Cheque/ NEFT/ UTR No.": "Cheque/ NEFT/ UTR No.",
-        "Patient Name": "Patient Name",
-        "Settled Amount": "Settled Amount",
+        "Claim No": "Claim Number"
     },
     "CARE HEALTH INSURANCE LIMITED": {
         "Cheque/ NEFT/ UTR No.": "NEFT Number",
-        "Patient Name": "Patient Name",
-        "Settled Amount": "Settled Amount",
+        "Claim No": "Claim Number"
     },
     "HEALTH INDIA INSURANCE TPA SERVICES PRIVATE LTD.": {
         "Cheque/ NEFT/ UTR No.": "utrnumber",
-        "Patient Name": "Patient Name",
-        "Settled Amount": "SettledAmount",
+        "Claim No": "Claim Number"
     },
     "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED": {
         "Cheque/ NEFT/ UTR No.": "UTR No",
-        "Patient Name": "Insuredname",
-        "Settled Amount": "Approved_Amount",
+        "Claim No": "REF_CCN"
     },
     "MEDSAVE HEALTHCARE TPA PVT LTD": {
         "Cheque/ NEFT/ UTR No.": "UTR/Chq No.",
-        "Patient Name": "Patient Name",
-        "Settled Amount": "Net Approved Amt",
+        "Claim No": "Claim Number"
     },
     "PARAMOUNT HEALTHCARE": {
         "Cheque/ NEFT/ UTR No.": "UTR_NO",
-        "Patient Name": "NAME",
-        "Settled Amount": "AMOUNT_PAID",
+        "Claim No": "Claim Number"
     },
     "PARK MEDICLAIM INSURANCE TPA PRIVATE LIMITED": {
         "Cheque/ NEFT/ UTR No.": "Chq No",
-        "Patient Name": "Insured Name",
-        "Settled Amount": "Grant Amount",
+        "Claim No": "Claim Number"
     },
     "SAFEWAY INSURANCE TPA PVT.LTD": {
         "Cheque/ NEFT/ UTR No.": "'Chequeno",
-        "Patient Name": "'PatientName",
-        "Settled Amount": "'ApprovedAmt",
+        "Claim No": "Claim Number"
     },
     "STAR HEALTH & ALLIED HEALTH INSURANCE CO.LTD.": {
         "Cheque/ NEFT/ UTR No.": "UTR",
-        "Patient Name": "Patient Name",
-        "Settled Amount": "Claim Net Pay Amount",
+        "Claim No": "Claim ID"
     },
     "VOLO HEALTH INSURANCE TPA PVT.LTD (EWA) (Mail Extract)": {
         "Cheque/ NEFT/ UTR No.": "UTR Number",
-        "Patient Name": "Claimant Name",
-        "Settled Amount": "Total_Payment_Recd",
+        "Claim No": "Alternate Claim Id"
     }
 }
-
-# ---------- Activity Logging Helper ----------
-def log_activity(
-    username: str,
-    bank_type: str,
-    step_completed: int,
-    run_id: str,
-    duration_seconds: Optional[int] = None,
-    row_counts: Optional[dict] = None,
-    tpa_name: Optional[str] = None,
-    success: bool = True,
-    error_message: Optional[str] = None
-):
-    """Log reconciliation activity to database"""
-    if activity_logs_collection is None:
-        print("[Activity] Logging disabled (no database connection)")
-        return
-    
-    try:
-        activity = {
-            "username": username,
-            "bank_type": bank_type,
-            "step_completed": step_completed,
-            "run_id": run_id,
-            "timestamp": datetime.utcnow(),
-            "duration_seconds": duration_seconds,
-            "row_counts": row_counts or {},
-            "tpa_name": tpa_name,
-            "success": success,
-            "error_message": error_message
-        }
-        
-        activity_logs_collection.insert_one(activity)
-        print(f"[Activity] Logged: {username} - Step {step_completed} - {bank_type}")
-    except Exception as e:
-        print(f"[Activity] Failed to log activity: {e}")
-
-# ---------- Helpers ----------
-def _norm(s):
-    s = "" if pd.isna(s) else str(s)
-    return "".join(s.upper().split())
+TPA_CHOICES = list(TPA_MIS_MAPS.keys())
 
 def _to_amt(x):
     try:
         s = str(x).replace(",", "").strip()
-        if s in ["", "-", "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â"]: return np.nan
+        if s in ["", "-", "ÃƒÆ’Ã†â€™️Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â "]: return np.nan
         if s.startswith("(") and s.endswith(")"): return -round(float(s[1:-1]), 2)
         return round(float(s), 2)
     except: return np.nan
+
+def _clean_key_series(series: pd.Series) -> pd.Series:
+    _NULL_TOKENS = {"", "nan", "none", "null", "na", "n/a", "n\\a"}
+    s = series.copy().astype("string") 
+    s = s.str.replace("\xa0", " ", regex=False).str.strip()
+    lower = s.str.lower()
+    s = s.mask(lower.isin(_NULL_TOKENS), pd.NA)
+    return s.astype(object).where(s.notna(), np.nan)
+
+# ==========================================
+#  PART 2: BANK & ADVANCE CLEANERS
+# ==========================================
+
+def clean_raw_bank_statement_icici(path):
+    def _extract_table_from_raw(raw):
+        if raw.dropna(how="all").empty: return None
+        header_row_idx = None
+        for i, row in raw.iterrows():
+            vals = [str(v).strip() for v in row.tolist() if pd.notna(v)]
+            if "Transaction ID" in vals and "Description" in vals:
+                header_row_idx = i
+                break
+        if header_row_idx is None:
+            if len(raw) > 6: header_row_idx = 6
+            else: return None
+        header_vals = [str(x).strip() for x in raw.iloc[header_row_idx].tolist()]
+        df = raw.iloc[header_row_idx + 1:].copy()
+        if df.shape[1] < len(header_vals):
+            for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
+        df = df.iloc[:, :len(header_vals)]
+        df.columns = header_vals
+        return df
+
+    path = Path(path)
+    tables = []
+    try:
+        xls = pd.ExcelFile(path)
+        for sheet in xls.sheet_names:
+            raw = xls.parse(sheet_name=sheet, header=None)
+            tbl = _extract_table_from_raw(raw)
+            if tbl is not None: tables.append(tbl)
+    except:
+        try:
+            raw = pd.read_csv(path, header=None)
+            tbl = _extract_table_from_raw(raw)
+            if tbl is not None: tables.append(tbl)
+        except: pass
+
+    if not tables:
+        raise ValueError("ICICI bank parser: No usable transaction table found.")
+    df_all = pd.concat(tables, ignore_index=True)
+    
+    keep_cols = ["No.", "Transaction ID", "Txn Posted Date", "Description", "Cr/Dr", "Transaction Amount(INR)"]
+    existing = [c for c in keep_cols if c in df_all.columns]
+    df = df_all[existing].copy().dropna(how="all")
+    
+    if not df.empty:
+        def _is_repeated_header(row):
+            for c in existing:
+                if str(row[c]).strip() != c: return False
+            return True
+        df = df[~df.apply(_is_repeated_header, axis=1)]
+
+    if "Description" in df.columns:
+        desc = df["Description"].astype(str).str.upper()
+        pattern = r"TOTAL|OPENING BALANCE|CLOSING BALANCE|BALANCE BROUGHT FORWARD"
+        df = df[~desc.str.contains(pattern, regex=True, na=False)]
+
+    for col in ["No.", "Transaction Amount(INR)"]:
+        if col in df.columns: df[col] = pd.to_numeric(df[col], errors="ignore")
+    return df.drop_duplicates().reset_index(drop=True)
+
+def clean_raw_bank_statement_axis(path):
+    def _extract_table_from_raw(raw: pd.DataFrame):
+        if raw.dropna(how="all").empty: return None
+        header_row_idx = None
+        for i, row in raw.iterrows():
+            vals = [str(v).strip() for v in row.tolist() if pd.notna(v)]
+            upper_vals = [v.upper() for v in vals]
+            if (any(v == "S.NO" for v in upper_vals) and 
+                any("TRANSACTION DATE" in v for v in upper_vals) and 
+                any("PARTICULARS" in v for v in upper_vals)):
+                header_row_idx = i
+                break
+        if header_row_idx is None: return None
+        header_vals = [str(x).strip() for x in raw.iloc[header_row_idx].tolist()]
+        df = raw.iloc[header_row_idx + 1:].copy()
+        if df.shape[1] < len(header_vals):
+            for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
+        df = df.iloc[:, :len(header_vals)]
+        df.columns = header_vals
+        return df
+
+    path = Path(path)
+    tables = []
+    try:
+        xls = pd.ExcelFile(path)
+        for sheet in xls.sheet_names:
+            raw = xls.parse(sheet_name=sheet, header=None)
+            tbl = _extract_table_from_raw(raw)
+            if tbl is not None: tables.append(tbl)
+    except:
+        try:
+            raw = pd.read_csv(path, header=None)
+            tbl = _extract_table_from_raw(raw)
+            if tbl is not None: tables.append(tbl)
+        except: pass
+
+    if not tables:
+        raise ValueError("Axis bank parser: No usable transaction table found.")
+    df_all = pd.concat(tables, ignore_index=True)
+
+    orig_to_canon = {
+        "S.No": "No.", "Transaction Date (dd/mm/yyyy)": "Txn Posted Date",
+        "Value Date (dd/mm/yyyy)": "Value Date", "Particulars": "Description",
+        "Amount(INR)": "Transaction Amount(INR)", "Transaction Amount(INR)": "Transaction Amount(INR)",
+        "Debit/Credit": "Cr/Dr", "Balance(INR)": "Balance(INR)",
+        "Cheque Number": "Cheque Number", "Branch Name(SOL)": "Branch Name(SOL)"
+    }
+    canon_cols_order = ["No.", "Txn Posted Date", "Value Date", "Description", "Cr/Dr", 
+                       "Transaction Amount(INR)", "Balance(INR)", "Cheque Number", "Branch Name(SOL)"]
+    
+    col_map = {c: orig_to_canon[c] for c in df_all.columns if c in orig_to_canon}
+    canon_df = pd.DataFrame()
+    for canon in canon_cols_order:
+        sources = [src for src, tgt in col_map.items() if tgt == canon]
+        canon_df[canon] = df_all[sources[0]] if sources else np.nan
+
+    canon_df = canon_df.dropna(how="all")
+    if "Description" in canon_df.columns:
+        desc_upper = canon_df["Description"].astype(str).str.upper()
+        pattern = r"OPENING BALANCE|CLOSING BALANCE|BALANCE BROUGHT FORWARD|TOTAL"
+        canon_df = canon_df[~desc_upper.str.contains(pattern, regex=True, na=False)]
+
+    for col in ["Transaction Amount(INR)", "Balance(INR)"]:
+        if col in canon_df.columns:
+            canon_df[col] = canon_df[col].astype(str).str.replace(",", "", regex=False).str.strip()
+            canon_df[col] = pd.to_numeric(canon_df[col], errors="ignore")
+            
+    return canon_df.drop_duplicates().reset_index(drop=True)
+
+def read_clean_icici_advance_excel(xlsx_path: Path, deduplicate: bool = True) -> pd.DataFrame:
+    def _extract_table_from_raw(raw: pd.DataFrame):
+        if raw.dropna(how="all").empty: return None
+        header_row_idx = None
+        for i, row in raw.iterrows():
+            vals = [str(v).strip() for v in row.tolist() if pd.notna(v)]
+            upper_vals = [v.upper() for v in vals]
+            if (any(v == "MSG REFER.NO" for v in upper_vals) and any(v == "AMOUNT" for v in upper_vals)):
+                header_row_idx = i
+                break
+        if header_row_idx is None: return None
+        header_vals = [str(x).strip() for x in raw.iloc[header_row_idx].tolist()]
+        df = raw.iloc[header_row_idx + 1:].copy()
+        if df.shape[1] < len(header_vals):
+            for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
+        df = df.iloc[:, :len(header_vals)]
+        df.columns = header_vals
+        return df
+
+    path = Path(xlsx_path)
+    tables = []
+    try:
+        xls = pd.ExcelFile(path)
+        for sheet in xls.sheet_names:
+            raw = xls.parse(sheet_name=sheet, header=None, dtype=object)
+            tbl = _extract_table_from_raw(raw)
+            if tbl is not None: tables.append(tbl)
+    except:
+        try:
+            raw = pd.read_csv(path, header=None)
+            tbl = _extract_table_from_raw(raw)
+            if tbl is not None: tables.append(tbl)
+        except: pass
+
+    if not tables:
+        raise ValueError("ICICI Advance Excel parser: No usable data table found.")
+    df = pd.concat(tables, ignore_index=True).dropna(how="all").reset_index(drop=True)
+    
+    df.columns = [str(c).strip().replace(".", "_").replace(" ", "_") for c in df.columns]
+    
+    def _cnorm(name): return re.sub(r"[^a-z0-9]", "", name.lower())
+    refer_col, msg_col = None, None
+    for c in df.columns:
+        n = _cnorm(c)
+        if refer_col is None and n in ("referno", "refno"): refer_col = c
+        if msg_col is None and "msgreferno" in n: msg_col = c
+
+    df["Refer_No"] = df[refer_col].astype(str) if refer_col else ""
+    if msg_col: df["Msg_Refer_No"] = df[msg_col].astype(str).str.strip()
+    elif "Msg_Refer_No" not in df.columns: df["Msg_Refer_No"] = df["Refer_No"]
+
+    df["Refer_No_UTR"] = df["Refer_No"].apply(lambda x: str(x).replace("/XUTR/", "").replace("XUTR/", "").strip() if pd.notna(x) else "")
+    df["Msg_Refer_No"] = _clean_key_series(df["Msg_Refer_No"])
+    df["Refer_No_UTR"] = _clean_key_series(df["Refer_No_UTR"])
+    
+    if deduplicate and "Refer_No_UTR" in df.columns:
+        df = df.drop_duplicates(subset=["Refer_No_UTR"], keep="last")
+    return df.reset_index(drop=True)
+
+def read_clean_axis_advance_excel(x_path, deduplicate: bool = True) -> pd.DataFrame:
+    def _extract_table_from_raw(raw: pd.DataFrame):
+        if raw.dropna(how="all").empty: return None
+        header_row_idx = None
+        for i, row in raw.iterrows():
+            vals = [str(v).strip() for v in row.tolist() if pd.notna(v)]
+            upper_vals = [v.upper() for v in vals]
+            if (any(v == "TXN_AMOUNT_IN_RS" for v in upper_vals) and any(v == "TRANID" for v in upper_vals)):
+                header_row_idx = i
+                break
+        if header_row_idx is None: return None
+        header_vals = [str(x).strip() for x in raw.iloc[header_row_idx].tolist()]
+        df = raw.iloc[header_row_idx + 1:].copy()
+        if df.shape[1] < len(header_vals):
+            for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
+        df = df.iloc[:, :len(header_vals)]
+        df.columns = header_vals
+        return df
+
+    path = Path(x_path)
+    tables = []
+    try:
+        xls = pd.ExcelFile(path)
+        for sheet in xls.sheet_names:
+            raw = xls.parse(sheet_name=sheet, header=None, dtype=object)
+            tbl = _extract_table_from_raw(raw)
+            if tbl is not None: tables.append(tbl)
+    except:
+        try:
+            raw = pd.read_csv(path, header=None)
+            tbl = _extract_table_from_raw(raw)
+            if tbl is not None: tables.append(tbl)
+        except: pass
+
+    if not tables:
+        raise ValueError("Axis Advance Excel parser: No usable data table found.")
+    df = pd.concat(tables, ignore_index=True).dropna(how="all").reset_index(drop=True)
+    df.columns = [str(c).strip().replace(".", "_").replace(" ", "_") for c in df.columns]
+    
+    def _cnorm(name): return re.sub(r"[^a-z0-9]", "", name.lower())
+    utr_col, tranid_col, primary_col = None, None, None
+    for c in df.columns:
+        n = _cnorm(c)
+        if utr_col is None and n == "utr": utr_col = c
+        if tranid_col is None and n == "tranid": tranid_col = c
+        if primary_col is None and n == "primarykey": primary_col = c
+
+    df["Msg_Refer_No"] = df[utr_col].astype(str).str.strip() if utr_col else ""
+    df["Refer_No_UTR"] = df[tranid_col].astype(str).str.strip() if tranid_col else ""
+    
+    clean_u = lambda x: str(x).replace("/XUTR/", "").replace("XUTR/", "").strip() if pd.notna(x) else ""
+    df["Msg_Refer_No"] = df["Msg_Refer_No"].apply(clean_u)
+    df["Refer_No_UTR"] = df["Refer_No_UTR"].apply(clean_u)
+
+    df["Msg_Refer_No"] = _clean_key_series(df["Msg_Refer_No"])
+    df["Refer_No_UTR"] = _clean_key_series(df["Refer_No_UTR"])
+
+    if deduplicate:
+        if primary_col is not None:
+            df[primary_col] = _clean_key_series(df[primary_col])
+            df = df.drop_duplicates(subset=[primary_col], keep="last")
+        elif "Refer_No_UTR" in df.columns:
+            df = df.drop_duplicates(subset=["Refer_No_UTR"], keep="last")
+    return df.reset_index(drop=True)
+
+# ==========================================
+#  PART 3: MATCHING & MIS PARSING
+# ==========================================
+
+def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
+    if bank_df.empty: return pd.DataFrame(), bank_df
+    parts = []
+    if "Msg_Refer_No" not in adv_df.columns and "Refer_No_UTR" in adv_df.columns:
+        adv_df = adv_df.copy()
+        adv_df["Msg_Refer_No"] = adv_df["Refer_No_UTR"]
+    
+    adv_df = adv_df.copy()
+    if "Msg_Refer_No" in adv_df.columns: adv_df["Msg_Refer_No"] = _clean_key_series(adv_df["Msg_Refer_No"])
+    if "Refer_No_UTR" in adv_df.columns: adv_df["Refer_No_UTR"] = _clean_key_series(adv_df["Refer_No_UTR"])
+
+    col_to_search = "Description" if "Description" in bank_df.columns else bank_df.columns[1]
+    keys = pd.Series(adv_df["Msg_Refer_No"]).dropna().astype(str).map(str.strip).unique()
+
+    for msg in keys:
+        s = msg.strip()
+        if not s: continue
+        m = bank_df[col_to_search].astype(str).str.contains(s, regex=False, na=False)
+        if m.any():
+            t = bank_df.loc[m].copy()
+            t["Matched_Key"] = s
+            parts.append(t)
+            
+    if not parts: return pd.DataFrame(), bank_df
+    
+    matched = pd.concat(parts, ignore_index=True).merge(
+        adv_df, left_on="Matched_Key", right_on="Msg_Refer_No", how="inner", suffixes=("_bank", "_adv")
+    ).drop_duplicates()
+
+    if "Transaction ID" in bank_df.columns and "Transaction ID" in matched.columns:
+        not_in = bank_df.loc[~bank_df["Transaction ID"].isin(matched["Transaction ID"])]
+    else:
+        not_in = bank_df.loc[~bank_df["Description"].isin(matched["Description"])]
+    return matched, not_in
+
+def parse_mis_universal(mis_path, tpa_name: str, empty_threshold: float = 0.5) -> pd.DataFrame:
+    mis_path = Path(mis_path)
+    if tpa_name not in TPA_MIS_MAPS: 
+        raise ValueError(f"Unknown TPA '{tpa_name}'")
+    mapping = TPA_MIS_MAPS[tpa_name]
+    expected_sources = list(mapping.values())
+    
+    def _norm_local(s): return re.sub(r"[^A-Z0-9]", "", str(s).upper())
+    expected_norm = {_norm_local(x) for x in expected_sources + list(mapping.keys())}
+    
+    def _hunt_header(raw):
+        best_idx, best_score = None, -1
+        for i in range(min(80, len(raw))):
+            row_vals = [str(v).strip() for v in raw.iloc[i].tolist()]
+            hits = sum(1 for v in row_vals if _norm_local(v) in expected_norm)
+            if hits > best_score: best_idx, best_score = i, hits
+        return best_idx if best_idx is not None and best_score >= 1 else None
+
+    def _extract_from_sheet(raw):
+        if raw.dropna(how="all").empty: return None
+        header_idx = _hunt_header(raw)
+        if header_idx is None: return None
+        header_vals = [str(x).strip() for x in raw.iloc[header_idx].tolist()]
+        df = raw.iloc[header_idx + 1:].copy()
+        if df.shape[1] < len(header_vals):
+            for _ in range(len(header_vals) - df.shape[1]): df[df.shape[1]] = np.nan
+        df = df.iloc[:, :len(header_vals)]
+        df.columns = header_vals
+        return df.dropna(how="all").reset_index(drop=True)
+
+    tables = []
+    try:
+        xls = pd.ExcelFile(mis_path)
+        for sh in xls.sheet_names:
+            tbl = _extract_from_sheet(xls.parse(sh, header=None, dtype=str))
+            if tbl is not None: tables.append(tbl)
+    except:
+        try:
+            tbl = _extract_from_sheet(pd.read_csv(mis_path, header=None, dtype=str))
+            if tbl is not None: tables.append(tbl)
+        except: pass
+        
+    if not tables: 
+        raise ValueError(f"Universal MIS parser: No table detected for '{tpa_name}'")
+    return pd.concat(tables, ignore_index=True).reset_index(drop=True)
+
+def step3_map_to_mis(step2_df: pd.DataFrame, mis_df: pd.DataFrame, tpa_name: str, deduplicate: bool = True):
+    if step2_df.empty: return pd.DataFrame()
+    mapping = TPA_MIS_MAPS.get(tpa_name)
+    mis_std = mis_df.rename(columns={v: k for k, v in mapping.items()}).copy()
+    
+    if "Cheque/ NEFT/ UTR No." not in mis_std.columns:
+        raise ValueError(f"MIS mapping failed: UTR column not found.")
+    
+    s2 = step2_df.copy()
+    s2["Refer_No_UTR"] = _clean_key_series(s2["Refer_No_UTR"])
+    mis_std["Cheque/ NEFT/ UTR No."] = _clean_key_series(mis_std["Cheque/ NEFT/ UTR No."])
+    if "Claim No" in mis_std.columns: mis_std["Claim No"] = _clean_key_series(mis_std["Claim No"])
+    
+    s2 = s2.dropna(subset=["Refer_No_UTR"])
+    mis_std = mis_std.dropna(subset=["Cheque/ NEFT/ UTR No."])
+    
+    merged = s2.merge(
+        mis_std, left_on="Refer_No_UTR", right_on="Cheque/ NEFT/ UTR No.", how="inner", suffixes=("", "_mis")
+    )
+    return merged.drop_duplicates() if deduplicate else merged
+
+# ==========================================
+#  PART 4: OUTSTANDING & HELPERS
+# ==========================================
+
+_FOOTER_TOKENS = ["SUB TOTAL", "SUBTOTAL", "TOTAL", "GRAND TOTAL"]
+_OUT_HEADER_KEYS = ["Sl No", "Bill No", "Date", "CR No", "Patient Name", "Net Amount", 
+                   "Amount Paid", "TDS", "Write-Off", "Balance", "Location", "Consultant", "Claim No", "Insurance Company"]
+
+def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
+    raw = pd.read_excel(xlsx_path, header=None, dtype=str)
+    
+    def _hunt_header(df_raw):
+        norm = lambda s: re.sub(r"[^A-Z]", "", str(s).upper())
+        targets = [norm(k) for k in _OUT_HEADER_KEYS]
+        best_idx, best_hits = None, -1
+        for i in range(min(len(df_raw), 60)):
+            row = df_raw.iloc[i].fillna("").astype(str).tolist()
+            hits = sum(1 for c in row if norm(c) in targets or (norm(c).startswith("CONSUL") and "CONSULTANT" in targets))
+            if hits > best_hits: best_idx, best_hits = i, hits
+        if best_idx is None or best_hits <= 2: raise ValueError("Outstanding parser: Header not found.")
+        return best_idx
+
+    hdr_idx = _hunt_header(raw)
+    header_vals = [str(x).strip() for x in raw.iloc[hdr_idx].tolist()]
+    header_norm = []
+    for h in header_vals:
+        hn = str(h).strip()
+        if re.sub(r"[^A-Za-z]", "", hn).lower().startswith("consul"): hn = "Consultant"
+        if hn.strip().lower() == "insurance companies": hn = "Insurance Company"
+        header_norm.append(hn)
+        
+    df = raw.iloc[hdr_idx + 1:].copy()
+    if df.shape[1] < len(header_norm):
+        for _ in range(len(header_norm) - df.shape[1]): df[df.shape[1]] = ""
+    df = df.iloc[:, :len(header_norm)]
+    df.columns = header_norm
+
+    ent_col, current_entity, header_rows = [], "", []
+    for idx, row in df.iterrows():
+        vals = row.fillna("").astype(str).tolist()
+        if vals[0].strip() and all(not str(v).strip() for v in vals[1:]):
+            current_entity = vals[0].replace("\xa0", " ").strip()
+            header_rows.append(idx)
+        ent_col.append(current_entity)
+    df["Insurance Company Automated"] = ent_col
+    if header_rows: df = df.drop(index=header_rows)
+    
+    df = df[~df.apply(lambda r: any(t in " ".join([str(x) for x in r]).upper() for t in _FOOTER_TOKENS), axis=1)]
+    for c in df.columns: df[c] = df[c].astype(str).str.replace("\xa0", " ", regex=False).str.strip()
+    return df.reset_index(drop=True)
+
+def step4_strict_matches(step3_df: pd.DataFrame, outstanding_path: Path, deduplicate: bool = True):
+    if step3_df.empty: return pd.DataFrame(), pd.DataFrame()
+    if "Claim No" not in step3_df.columns: raise ValueError("Step 3 missing Claim No")
+    
+    out = parse_outstanding_excel_to_clean(outstanding_path).copy()
+    if "Claim No" in out.columns: out = out.rename(columns={"Claim No": "Claim No_out"})
+    
+    def _clean_claim(val):
+        if pd.isna(val): return ""
+        s = str(val).strip()
+        if s.lower() in ['nan', 'none', 'null', 'na', 'n/a', '']: return ""
+        if s.endswith(".0"): s = s[:-2]
+        return s
+
+    L, R = out.copy(), step3_df.copy()
+    L["_CLAIM_KEY"] = L.get("Claim No_out", "").apply(_clean_claim)
+    R["_CLAIM_KEY"] = R["Claim No"].apply(_clean_claim)
+    
+    matched_merged = L[L["_CLAIM_KEY"] != ""].merge(R[R["_CLAIM_KEY"] != ""], on="_CLAIM_KEY", how="inner", suffixes=("_out", "_m3"))
+    matched = matched_merged.drop(columns=["_CLAIM_KEY"])
+    if deduplicate: matched = matched.drop_duplicates()
+    
+    matched_keys = matched_merged["_CLAIM_KEY"].unique()
+    unmatched_step3 = R[~R["_CLAIM_KEY"].isin(matched_keys)].copy()
+    unmatched_step3 = unmatched_step3.drop(columns=["_CLAIM_KEY"])
+    if deduplicate: unmatched_step3 = unmatched_step3.drop_duplicates()
+    
+    return matched, unmatched_step3
 
 def save_xlsx(df: pd.DataFrame, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,666 +583,75 @@ def save_xlsx(df: pd.DataFrame, path: Path) -> Path:
 def new_run_dir() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     p = RUN_ROOT / f"reco_outputs_{stamp}"
-    if p.exists():
-        shutil.rmtree(p)
+    shutil.rmtree(p, ignore_errors=True)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 def zip_outputs(paths, zip_path: Path):
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for p in paths:
-            z.write(p, p.name)
+            if p.exists(): z.write(p, p.name)
 
-def ensure_xlsx(path: Path) -> Path:
-    path = Path(path)
-    if path.suffix.lower() == ".xls":
-        df = pd.read_excel(path, dtype=str)
-        new_path = path.with_suffix(".xlsx")
-        df.to_excel(new_path, index=False)
-        return new_path
-    return path
+def log_activity(username, bank_type, step, run_id, duration=None, counts=None, tpa=None, success=True, error=None):
+    if activity_logs_collection is not None:
+        try:
+            activity_logs_collection.insert_one({
+                "username": username, "bank_type": bank_type, "step_completed": step, "run_id": run_id,
+                "timestamp": datetime.utcnow(), "duration_seconds": duration, "row_counts": counts or {},
+                "tpa_name": tpa, "success": success, "error_message": error
+            })
+        except: pass
 
-# ---------- ICICI Bank (Excel) ----------
-def clean_raw_bank_statement_icici(path: Path) -> pd.DataFrame:
-    raw = pd.read_excel(path, dtype=str, header=None)
-    header_row_idx = None
-    for i, row in raw.iterrows():
-        vals = [str(v).strip() for v in row.tolist() if pd.notna(v)]
-        if "Transaction ID" in vals and "Description" in vals:
-            header_row_idx = i
-            break
-    if header_row_idx is None:
-        raise ValueError("Could not detect header row in bank statement.")
-    df = pd.read_excel(path, dtype=str, header=header_row_idx)
-    keep_cols = ["No.", "Transaction ID", "Txn Posted Date",
-                 "Description", "Cr/Dr", "Transaction Amount(INR)"]
-    df = df[[c for c in keep_cols if c in df.columns]]
-    return df.dropna(how="all").reset_index(drop=True)
-
-# ---------- AXIS Bank (PDF) ----------
-def _row_has_banner(row_vals) -> bool:
-    joined = " ".join([("" if v is None else str(v)) for v in row_vals])
-    flat = re.sub(r"\s+", "", joined).upper()
-    tokens = [
-        "OPENINGBALANCE","CARRYFORWARDBALANCE","TRANSACTIONTOTAL","CLOSINGBALANCE",
-        "TRANDATEVALUEDATE",
-    ]
-    return any(tok in flat for tok in tokens)
-
-def _prefix_from_col0(c0: str) -> str:
-    s = str(c0 or "").strip()
-    mdate = re.search(r"\d{2}/\d{2}/\d{4}", s)
-    if mdate: s = s[:mdate.start()]
-    s = re.sub(r"[^A-Za-z]", "", s)
-    return s[:3]
-
-def clean_raw_bank_statement_axis_pdf(pdf_path: Path):
-    frames = []
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for page in pdf.pages:
-            for t in (page.extract_tables() or []):
-                if not t: continue
-                rows = [[("" if v is None else str(v)).replace("\n"," ").strip() for v in r] for r in t]
-                frames.append(pd.DataFrame(rows))
-    if not frames:
-        raise ValueError("No tables found in Axis Bank PDF.")
-    raw = pd.concat(frames, ignore_index=True)
-    raw = raw[~raw.apply(lambda r: _row_has_banner(list(r.values)), axis=1)].reset_index(drop=True)
-
-    col0 = raw.iloc[:,0].astype(str) if raw.shape[1] > 0 else pd.Series([""]*len(raw))
-    col1 = raw.iloc[:,1].astype(str) if raw.shape[1] > 1 else pd.Series([""]*len(raw))
-    col3 = raw.iloc[:,3].astype(str) if raw.shape[1] > 3 else pd.Series([""]*len(raw))
-    col4 = raw.iloc[:,4].astype(str) if raw.shape[1] > 4 else pd.Series([""]*len(raw))
-
-    tran_dates, value_dates = [], []
-    date_re = re.compile(r"\d{2}/\d{2}/\d{4}")
-    for c in col0:
-        ds = date_re.findall(c)
-        tran_dates.append(ds[0] if len(ds) > 0 else "")
-        value_dates.append(ds[1] if len(ds) > 1 else "")
-
-    def make_desc(c0, c1):
-        prefix = _prefix_from_col0(c0)
-        d = str(c1 or "").strip()
-        if prefix and not d[:len(prefix)].lower() == prefix.lower():
-            return (prefix + d).strip()
-        return d
-    description = [make_desc(c0, c1) for c0, c1 in zip(col0, col1)]
-
-    debit  = col3.apply(_to_amt)
-    credit = col4.apply(_to_amt)
-    crdr, amt = [], []
-    for d,c in zip(debit,credit):
-        if not np.isnan(c): crdr.append("Cr"); amt.append(c)
-        elif not np.isnan(d): crdr.append("Dr"); amt.append(d)
-        else: crdr.append(""); amt.append(np.nan)
-
-    clean = pd.DataFrame({
-        "No.": range(1, len(raw)+1),
-        "Transaction ID": "",
-        "Tran Date": tran_dates,
-        "Value Date": value_dates,
-        "Description": description,
-        "Cr/Dr": crdr,
-        "Transaction Amount(INR)": amt,
-    }).dropna(how="all").reset_index(drop=True)
-
-    return raw, clean
-
-# ---------- ICICI Advance (PDF) - PyMuPDF version ----------
-def read_clean_pdf_to_df_icici_advance(pdf_path: Path) -> pd.DataFrame:
-    """
-    Parse ICICI Advance Account Statement (PDF) using PyMuPDF tables.
-    Produces a tidy DataFrame with normalized headers and Refer_No_UTR.
-    Also ensures Msg_Refer_No exists (fallback to Refer_No_UTR), so Step-2 remains unchanged.
-    """
-    import fitz  # PyMuPDF
-    
-    doc = fitz.open(str(pdf_path))
-    all_rows = []
-    header = None
-
-    for page_idx in range(doc.page_count):
-        page = doc[page_idx]
-        tabs = page.find_tables()
-        if not tabs:
-            continue
-        for table in tabs.tables:
-            rows = table.extract() or []
-            for row in rows:
-                # Skip fully empty rows
-                if not any(str(cell).strip() for cell in row):
-                    continue
-                # Detect header one time (any cell containing 'S.No')
-                if any("S.No" in str(cell) for cell in row):
-                    if header is None:
-                        header = row
-                    # do not append header as data
-                    continue
-                all_rows.append(row)
-
-    doc.close()
-
-    if not all_rows or header is None:
-        raise ValueError("ICICI Advance PDF: No tabular data/header detected.")
-
-    # Group by S.No. (first cell): numeric = new record; else continuation
-    records_by_sno = {}
-    current_sno = None
-    for row in all_rows:
-        c0 = (str(row[0]).strip() if len(row) > 0 and row[0] is not None else "")
-        if c0.isdigit():
-            current_sno = int(c0)
-            records_by_sno.setdefault(current_sno, []).append(row)
-        elif current_sno is not None:
-            # continuation row for current S.No.
-            records_by_sno[current_sno].append(row)
-
-    # Merge fragments per S.No.
-    final_records = []
-    for sno in sorted(records_by_sno.keys()):
-        fragments = records_by_sno[sno]
-        if len(fragments) == 1:
-            final_records.append(fragments[0])
-        else:
-            max_cols = max(len(f) for f in fragments)
-            merged = [""] * max_cols
-            for frag in fragments:
-                for idx, cell in enumerate(frag):
-                    if idx >= max_cols:
-                        break
-                    if cell is None:
-                        continue
-                    c_str = str(cell).strip()
-                    if not c_str:
-                        continue
-                    old = str(merged[idx]).strip()
-                    if not old:
-                        merged[idx] = c_str
-                    else:
-                        # Append if different
-                        if c_str not in old:
-                            merged[idx] = (old + " " + c_str).strip()
-            final_records.append(merged)
-
-    # Build DataFrame
-    df = pd.DataFrame(final_records, columns=header)
-    df = df.dropna(how="all").reset_index(drop=True)
-
-    # Normalize column names (strip/replace)
-    df.columns = [str(c).strip().replace(".", "_").replace(" ", "_") for c in df.columns]
-
-    # Essential column checks
-    if "S_No_" not in df.columns:
-        raise ValueError("ICICI Advance PDF: 'S.No.' column not found after normalization.")
-    if "Refer_No" not in df.columns:
-        raise ValueError("ICICI Advance PDF: 'Refer_No' column not found after normalization.")
-
-    # Extract UTR (remove /XUTR/ prefix if present)
-    df["Refer_No_UTR"] = df["Refer_No"].apply(
-        lambda x: str(x).replace("/XUTR/", "").strip() if pd.notna(x) else ""
-    )
-
-    # Ensure Msg_Refer_No exists for Step-2 compatibility
-    if "Msg_Refer_No" not in df.columns:
-        df["Msg_Refer_No"] = df["Refer_No_UTR"]
-
-    return df
-
-# ---------- AXIS Advance (Excel) ----------
-def read_clean_axis_advance_xlsx(xlsx_path: Path) -> pd.DataFrame:
-    df = pd.read_excel(xlsx_path, dtype=str).dropna(how="all").reset_index(drop=True)
-    if "TRANID" not in df.columns:
-        raise ValueError("Axis Advance Excel missing TRANID")
-    if "UTR" not in df.columns:
-        raise ValueError("Axis Advance Excel missing UTR")
-    df["Msg_Refer_No"] = df["TRANID"].astype(str).str.strip()
-    df["Refer_No_UTR"] = df["UTR"].astype(str).str.strip().str.replace("^/XUTR/","",regex=True)
-    return df
-
-# ---------- Step 2 (Bank ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Advance) ----------
-def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
-    if bank_df.empty:
-        return pd.DataFrame(), bank_df
-    parts=[]
-    if "Msg_Refer_No" not in adv_df.columns and "Refer_No_UTR" in adv_df.columns:
-        adv_df = adv_df.copy()
-        adv_df["Msg_Refer_No"] = adv_df["Refer_No_UTR"]
-    for msg in adv_df["Msg_Refer_No"].dropna().astype(str).unique():
-        s = msg.strip()
-        if not s: continue
-        m = bank_df["Description"].str.contains(s, regex=False, na=False)
-        if m.any():
-            t = bank_df.loc[m].copy()
-            t["Matched_Key"] = s
-            parts.append(t)
-    if not parts:
-        return pd.DataFrame(), bank_df
-    matched = pd.concat(parts, ignore_index=True).merge(
-        adv_df, left_on="Matched_Key", right_on="Msg_Refer_No", how="inner", suffixes=("_bank","_adv")
-    )
-    matched = matched.drop_duplicates()
-    if "Transaction ID" in bank_df.columns and "Transaction ID" in matched.columns:
-        not_in = bank_df.loc[~bank_df["Transaction ID"].isin(matched["Transaction ID"])]
-    else:
-        not_in = bank_df.loc[~bank_df["Description"].isin(matched["Description"])]
-    return matched, not_in
-
-# ---------- Step 3 (to MIS) ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â TPA-aware ----------
-def step3_map_to_mis(step2_df: pd.DataFrame, mis_path: Path, tpa_name: str) -> pd.DataFrame:
-    if step2_df.empty:
-        return pd.DataFrame()
-    if "Refer_No_UTR" not in step2_df.columns:
-        raise ValueError("Step-2 data missing 'Refer_No_UTR'.")
-
-    if tpa_name not in TPA_MIS_MAPS:
-        raise ValueError(f"No MIS mapping registered for TPA: {tpa_name}")
-    mapping = TPA_MIS_MAPS[tpa_name]
-    missing_map = [c for c in CANON_COLS if c not in mapping]
-    if missing_map:
-        raise ValueError(f"Mapping incomplete for {tpa_name}. Needs: {missing_map}")
-
-    mis = pd.read_excel(mis_path, dtype=str)
-
-    missing_src = [src for src in mapping.values() if src not in mis.columns]
-    if missing_src:
-        raise ValueError(f"MIS file for {tpa_name} missing headers: {missing_src}")
-
-    mis_std = mis.rename(columns={v: k for k, v in mapping.items()})[CANON_COLS].copy()
-    for c in CANON_COLS:
-        mis_std[c] = mis_std[c].astype(str).str.strip()
-
-    merged = step2_df.merge(
-        mis_std,
-        left_on="Refer_No_UTR",
-        right_on="Cheque/ NEFT/ UTR No.",
-        how="inner",
-        suffixes=("", "_mis"),
-    )
-    return merged.drop_duplicates()
-
-# ---------- Outstanding Parser (header hunting + block headers ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 'Insurance Company Automated' + footer removal) ----------
-
-# Only true per-block footer tokens (tight to avoid accidental drops)
-_FOOTER_TOKENS = ["SUB TOTAL", "SUBTOTAL", "TOTAL", "GRAND TOTAL"]
-
-# Expected header names for hunting (tolerant to small typos like 'Consulatnt')
-_OUT_HEADER_KEYS = [
-    "Sl No","Bill No","Date","CR No","Patient Name","Net Amount","Amount Paid",
-    "TDS","Write-Off","Balance","Location","Consultant","Claim No","Insurance Company"
-]
-
-def _hunt_outstanding_header_row(df_raw: pd.DataFrame) -> int:
-    norm = lambda s: re.sub(r"[^A-Z]", "", str(s).upper())
-    targets = [norm(k) for k in _OUT_HEADER_KEYS]
-    best_idx, best_hits = None, -1
-    # Search first 60 rows max
-    for i in range(min(len(df_raw), 60)):
-        row = df_raw.iloc[i].fillna("").astype(str).tolist()
-        hits = 0
-        for cell in row:
-            nc = norm(cell)
-            if nc in targets or (nc.startswith("CONSUL") and "CONSULTANT" in targets):
-                hits += 1
-        if hits > best_hits:
-            best_idx, best_hits = i, hits
-    if best_idx is None or best_hits <= 2:
-        raise ValueError("Outstanding parser: could not confidently locate header row.")
-    return best_idx
-
-def _row_is_section_header_like(row: pd.Series) -> bool:
-    vals = row.fillna("").astype(str).tolist()
-    if not vals: return False
-    col0 = vals[0].strip()
-    others_empty = all((str(v).strip() == "") for v in vals[1:])
-    return bool(col0) and others_empty
-
-def _clean_entity_name(text: str) -> str:
-    s = (text or "").replace("\xa0", " ").strip()
-    s = re.sub(r"^\s*\d+\s*", "", s)  # drop leading numbering like '12    '
-    return re.sub(r"\s+", " ", s)
-
-def _row_is_footer_like(row: pd.Series) -> bool:
-    flat = " ".join([str(x) for x in row.fillna("").tolist()]).upper()
-    return any(tok in flat for tok in _FOOTER_TOKENS)
-
-def parse_outstanding_excel_to_clean(xlsx_path: Path) -> pd.DataFrame:
-    """
-    Parse Outstanding Excel file with:
-    - Header hunting (tolerant to position/typos)
-    - Block headers ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 'Insurance Company Automated' column
-    - Footer removal
-    """
-    # Read with no header; file is already ensured to be .xlsx by ensure_xlsx
-    raw = pd.read_excel(xlsx_path, header=None, dtype=str)
-    hdr_idx = _hunt_outstanding_header_row(raw)
-    header_vals = [str(x).strip() for x in raw.iloc[hdr_idx].tolist()]
-
-    # Normalize header typos and variants
-    header_norm = []
-    for h in header_vals:
-        hn = str(h).strip()
-        # Consulatnt ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ Consultant (tolerant)
-        if re.sub(r"[^A-Za-z]", "", hn).lower().startswith("consul"):
-            hn = "Consultant"
-        # Insurance companies ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ Insurance Company
-        if hn.strip().lower() == "insurance companies":
-            hn = "Insurance Company"
-        header_norm.append(hn)
-
-    df = raw.iloc[hdr_idx+1:].copy()
-    # Align width to header count
-    if df.shape[1] < len(header_norm):
-        # pad missing columns if any
-        for _ in range(len(header_norm) - df.shape[1]):
-            df[df.shape[1]] = ""
-    df = df.iloc[:, :len(header_norm)]
-    df.columns = header_norm
-
-    # Build Insurance Company Automated by propagating entity headers
-    ent_col = []
-    current_entity = ""
-    header_row_indices = []
-    for idx, row in df.iterrows():
-        if _row_is_section_header_like(row):
-            current_entity = _clean_entity_name(row.iloc[0])
-            header_row_indices.append(idx)
-        ent_col.append(current_entity)
-    df["Insurance Company Automated"] = ent_col
-
-    # Drop the section header rows themselves
-    if header_row_indices:
-        df = df.drop(index=header_row_indices)
-
-    # Drop footer-like rows
-    df = df[~df.apply(_row_is_footer_like, axis=1)]
-
-    # Whitespace cleanup
-    for c in df.columns:
-        df[c] = df[c].astype(str).str.replace("\xa0", " ", regex=False).str.strip()
-
-    # Sanity: required columns for Step-4 strict match
-    for col in ["Patient Name","CR No","Balance"]:
-        if col not in df.columns:
-            raise ValueError(f"Outstanding parser: missing required column '{col}' after parsing.")
-
-    return df.reset_index(drop=True)
-
-# ---------- Step 4 (Outstanding strict) - Updated to use new parser ----------
-def step4_strict_matches(step3_df: pd.DataFrame, outstanding_path: Path) -> pd.DataFrame:
-    if step3_df.empty:
-        return pd.DataFrame()
-    
-    # Parse raw Outstanding (xls/xlsx already enforced by caller) into clean form
-    out = parse_outstanding_excel_to_clean(outstanding_path).copy()
-    
-    # Preserve original Step-4 behavior from this point onward
-    if "Claim No" in out.columns:
-        out = out.rename(columns={"Claim No": "Claim No_out"})
-    for col in ["Patient Name","CR No","Balance"]:
-        if col not in out.columns:
-            raise ValueError(f"Outstanding missing '{col}'.")
-    # Ã¢â€ â€œÃ¢â€ â€œÃ¢â€ â€œ UPDATED: only need Patient Name + Settled Amount in Step-3
-    for col in ["Patient Name","Settled Amount"]:
-        if col not in step3_df.columns:
-            raise ValueError(f"Step-3 missing '{col}'.")
-    L = out.copy(); R = step3_df.copy()
-    L["_PNORM"] = L["Patient Name"].apply(_norm)
-    R["_PNORM"] = R["Patient Name"].apply(_norm)
-    # Ã¢â€ â€œÃ¢â€ â€œÃ¢â€ â€œ UPDATED: only merge on Patient Name (no CR No matching)
-    merged = L.merge(R, on=["_PNORM"], how="inner", suffixes=("_out","_m3"))
-    bal  = merged["Balance"].apply(_to_amt)
-    sett = merged["Settled Amount"].apply(_to_amt)
-    ok_mask = (bal.notna() & sett.notna() & (bal == sett))
-    return merged.loc[ok_mask].drop(columns=["_PNORM"]).drop_duplicates()
-
-# ---------- API Endpoints ----------
+# ==================== API ENDPOINTS ====================
 
 @APP.get("/")
 async def root():
-    """Health check endpoint with CORS headers"""
-    return {
-        "status": "ok", 
-        "version": "16.22+auth", 
-        "auth_enabled": AUTH_ENABLED,
-        "cors_origins": cleaned_origins
-    }
-
-# ==================== AUTHENTICATION ENDPOINTS ====================
+    return {"status": "ok", "version": "17.9+ExcelCore+Auth", "auth_enabled": AUTH_ENABLED}
 
 @APP.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(user: UserRegister):
-    """
-    Register a new user
+    if not AUTH_ENABLED: raise HTTPException(503, "Authentication is not configured")
+    if users_collection is None: raise HTTPException(503, "Database not connected")
     
-    Body:
-    - username: string (3-50 chars, alphanumeric + _ -)
-    - password: string (min 6 chars)
-    - email: string (optional)
-    - full_name: string (optional)
-    """
-    if not AUTH_ENABLED:
-        raise HTTPException(status_code=503, detail="Authentication is not configured")
+    if users_collection.find_one({"username": user.username}):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Username already registered")
     
-    if users_collection is None:
-        raise HTTPException(status_code=503, detail="Database not connected")
-    
-    # Check if user already exists
-    existing_user = users_collection.find_one({"username": user.username})
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username already registered"
-        )
-    
-    # Create new user
     user_dict = {
-        "username": user.username,
-        "email": user.email,
-        "full_name": user.full_name,
-        "hashed_password": get_password_hash(user.password),
-        "created_at": datetime.utcnow(),
-        "is_active": True,
-        "email_verified": False,
-        "verification_token": None,
-        "verification_token_expires": None
+        "username": user.username, "email": user.email, "full_name": user.full_name,
+        "hashed_password": get_password_hash(user.password), "created_at": datetime.utcnow(),
+        "is_active": True, "email_verified": False, "verification_token": None
     }
-    
     try:
-        result = users_collection.insert_one(user_dict)
-        user_dict["_id"] = str(result.inserted_id)
-        
+        users_collection.insert_one(user_dict)
         return UserResponse(
-            username=user_dict["username"],
-            email=user_dict.get("email"),
-            full_name=user_dict.get("full_name"),
-            created_at=user_dict["created_at"],
+            username=user_dict["username"], email=user_dict.get("email"),
+            full_name=user_dict.get("full_name"), created_at=user_dict["created_at"],
             email_verified=user_dict.get("email_verified", False)
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create user: {str(e)}"
-        )
+        raise HTTPException(500, f"Failed to create user: {str(e)}")
 
 @APP.post("/auth/login", response_model=Token)
-async def login(
-    username: str = Form(...),
-    password: str = Form(...)
-):
-    """
-    Login to get access token
-    
-    Form Data (application/x-www-form-urlencoded):
-    - username: string
-    - password: string
-    
-    Returns:
-    - access_token: JWT token (valid for 7 days)
-    - token_type: "bearer"
-    """
-    print(f"[Login] Received login request for username: {username}")
-    print(f"[CORS] Login endpoint - CORS headers should be automatically added")
-    
-    if not AUTH_ENABLED:
-        raise HTTPException(status_code=503, detail="Authentication is not configured")
-    
+async def login(username: str = Form(...), password: str = Form(...)):
+    if not AUTH_ENABLED: raise HTTPException(503, "Authentication is not configured")
     user = authenticate_user(username, password)
-    if not user:
-        print(f"[Login] Authentication failed for username: {username}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    print(f"[Login] Authentication successful for username: {username}")
-    
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )
-    
-    print(f"[Login] Token created for username: {username}")
-    
-    return {"access_token": access_token, "token_type": "bearer"}
+    if not user: raise HTTPException(401, "Incorrect username or password", headers={"WWW-Authenticate": "Bearer"})
+    token = create_access_token({"sub": user.username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    return {"access_token": token, "token_type": "bearer"}
 
 @APP.get("/auth/me", response_model=UserResponse)
 async def get_current_user_info(current_user: UserInDB = Depends(get_current_user)):
-    """
-    Get current logged-in user information
-    
-    Requires: Authorization header with Bearer token
-    """
-    if not AUTH_ENABLED:
-        raise HTTPException(status_code=503, detail="Authentication is not configured")
-    
+    if not AUTH_ENABLED: raise HTTPException(503, "Auth disabled")
     return UserResponse(
-        username=current_user.username,
-        email=current_user.email,
-        full_name=current_user.full_name,
-        created_at=current_user.created_at,
+        username=current_user.username, email=current_user.email,
+        full_name=current_user.full_name, created_at=current_user.created_at,
         email_verified=current_user.email_verified
     )
 
-@APP.post("/auth/send-verification-email")
-async def send_verification_email_endpoint(
-    current_user: UserInDB = Depends(get_current_user)
-):
-    """Send email verification email to current user"""
-    if not AUTH_ENABLED or users_collection is None:
-        raise HTTPException(status_code=503, detail="Authentication is not configured")
-    
-    if not current_user.email:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No email address associated with this account"
-        )
-    
-    if current_user.email_verified:
-        return {
-            "status": "already_verified",
-            "message": "Email already verified"
-        }
-    
-    # Generate verification token
-    verification_token = secrets.token_urlsafe(32)
-    token_expires = datetime.utcnow() + timedelta(hours=24)
-    
-    # Update user with verification token
-    users_collection.update_one(
-        {"username": current_user.username},
-        {
-            "$set": {
-                "verification_token": verification_token,
-                "verification_token_expires": token_expires
-            }
-        }
-    )
-    
-    # Generate verification URL
-    frontend_url = os.getenv("FRONTEND_URL", "https://recondb.vercel.app")
-    verification_url = f"{frontend_url}/auth/verify-email?token={verification_token}"
-    
-    print(f"[Email Verification] Token: {verification_token}")
-    print(f"[Email Verification] URL: {verification_url}")
-    
-    # Try to send email
-    if EMAIL_ENABLED:
-        email_sent = send_verification_email(
-            to_email=current_user.email,
-            username=current_user.username,
-            verification_url=verification_url
-        )
-        
-        if email_sent:
-            return {
-                "status": "success",
-                "message": f"Verification email sent to {current_user.email}",
-                "expires_in_hours": 24
-            }
-    
-    # Email not sent but token saved
-    return {
-        "status": "partial_success",
-        "message": "Verification token generated but email could not be sent",
-        "verification_url": verification_url,  # For testing
-        "expires_in_hours": 24
-    }
-
-
-@APP.post("/auth/verify-email")
-async def verify_email_with_token(token: str = Form(...)):
-    """Verify user email with token"""
-    if not AUTH_ENABLED or users_collection is None:
-        raise HTTPException(status_code=503, detail="Authentication is not configured")
-    
-    # Find user with this token
-    user = users_collection.find_one({"verification_token": token})
-    
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired verification token"
-        )
-    
-    # Check if expired
-    if user.get("verification_token_expires"):
-        if datetime.utcnow() > user["verification_token_expires"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Verification token has expired"
-            )
-    
-    # Mark verified
-    users_collection.update_one(
-        {"username": user["username"]},
-        {
-            "$set": {"email_verified": True},
-            "$unset": {
-                "verification_token": "",
-                "verification_token_expires": ""
-            }
-        }
-    )
-    
-    print(f"[Email Verification] ✅ Verified: {user['username']}")
-    
-    return {
-        "status": "success",
-        "message": "Email verified successfully!",
-        "username": user["username"]
-    }
-
-
+# ✅ RESTORED: Verification Status Endpoint
 @APP.get("/auth/verification-status")
-async def get_verification_status(
-    current_user: UserInDB = Depends(get_current_user)
-):
-    """Get verification status"""
-    if not AUTH_ENABLED:
-        raise HTTPException(status_code=503, detail="Authentication is not configured")
-    
+async def get_verification_status(current_user: UserInDB = Depends(get_current_user)):
+    if not AUTH_ENABLED: raise HTTPException(503, "Authentication is not configured")
     return {
         "username": current_user.username,
         "email": current_user.email,
@@ -868,55 +659,165 @@ async def get_verification_status(
         "has_email": bool(current_user.email)
     }
 
-# ==================== PROTECTED ENDPOINTS ====================
-# All reconciliation endpoints now require authentication
+@APP.post("/auth/send-verification-email")
+async def send_verification_email_endpoint(current_user: UserInDB = Depends(get_current_user)):
+    if not AUTH_ENABLED or users_collection is None: raise HTTPException(503, "Auth disabled")
+    if not current_user.email: raise HTTPException(400, "No email address")
+    if current_user.email_verified: return {"status": "already_verified"}
+    
+    token = secrets.token_urlsafe(32)
+    users_collection.update_one(
+        {"username": current_user.username},
+        {"$set": {"verification_token": token, "verification_token_expires": datetime.utcnow() + timedelta(hours=24)}}
+    )
+    
+    verification_url = f"{os.getenv('FRONTEND_URL', 'https://recondb.vercel.app')}/auth/verify-email?token={token}"
+    if EMAIL_ENABLED:
+        if send_verification_email(current_user.email, current_user.username, verification_url):
+            return {"status": "success", "message": f"Sent to {current_user.email}"}
+    return {"status": "partial_success", "verification_url": verification_url}
 
-@APP.get("/download/{run_id}/{filename}")
-async def download_file(
-    run_id: str, 
-    filename: str,
-    current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
-):
-    """Download a specific file from a run (PROTECTED)"""
-    file_path = RUN_ROOT / run_id / filename
+@APP.post("/auth/verify-email")
+async def verify_email_with_token(token: str = Form(...)):
+    if not AUTH_ENABLED or users_collection is None: raise HTTPException(503, "Auth disabled")
+    user = users_collection.find_one({"verification_token": token})
+    if not user: raise HTTPException(400, "Invalid token")
+    if user.get("verification_token_expires") and datetime.utcnow() > user["verification_token_expires"]:
+        raise HTTPException(400, "Token expired")
     
-    print(f"[Download] Requested: {filename}")
-    print(f"[Download] Looking in: {file_path}")
-    print(f"[Download] File exists: {file_path.exists()}")
+    users_collection.update_one(
+        {"username": user["username"]},
+        {"$set": {"email_verified": True}, "$unset": {"verification_token": "", "verification_token_expires": ""}}
+    )
+    return {"status": "success", "username": user["username"]}
+
+@APP.post("/auth/change-password")
+async def change_password(current_password: str = Form(...), new_password: str = Form(...), current_user: UserInDB = Depends(get_current_user)):
+    if not AUTH_ENABLED or users_collection is None: raise HTTPException(503, "Auth disabled")
+    try:
+        from auth import verify_password
+    except ImportError:
+        raise HTTPException(500, "Password verification module missing in auth.py")
+
+    if not verify_password(current_password, current_user.hashed_password): raise HTTPException(401, "Wrong password")
+    if len(new_password) < 6: raise HTTPException(400, "Password too short")
+    users_collection.update_one({"username": current_user.username}, {"$set": {"hashed_password": get_password_hash(new_password)}})
+    return {"status": "success"}
+
+@APP.get("/profile/stats", response_model=UserStatsResponse)
+async def get_user_stats(current_user: UserInDB = Depends(get_current_user)):
+    if not AUTH_ENABLED or activity_logs_collection is None: raise HTTPException(503, "Stats unavailable")
+    activities = list(activity_logs_collection.find({"username": current_user.username, "success": True}, {"_id": 0}).sort("timestamp", -1))
     
-    if not file_path.exists():
-        run_dir = RUN_ROOT / run_id
-        if run_dir.exists():
-            available = [f.name for f in run_dir.iterdir()]
-            print(f"[Download] Available files: {available}")
-        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    completed = [a for a in activities if a.get("step_completed") == 4]
+    now = datetime.utcnow()
+    this_week = len([a for a in completed if a["timestamp"] >= now - timedelta(days=7)])
+    this_month = len([a for a in completed if a["timestamp"] >= now - timedelta(days=30)])
     
-    if filename.endswith('.zip'):
-        media_type = "application/zip"
-    elif filename.endswith('.pdf'):
-        media_type = "application/pdf"
-    else:
-        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    
-    print(f"[Download] Streaming file: {filename} ({media_type})")
-    
-    def file_iterator():
-        with open(file_path, "rb") as f:
-            yield f.read()
-    
-    return StreamingResponse(
-        file_iterator(),
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f"attachment; filename={filename}",
-            "Content-Type": media_type
-        }
+    streak = 0
+    if completed:
+        dates = sorted(set(a["timestamp"].date() for a in completed), reverse=True)
+        today, yesterday = now.date(), now.date() - timedelta(days=1)
+        if dates[0] in [today, yesterday]:
+            streak = 1
+            curr = dates[0] - timedelta(days=1)
+            for d in dates[1:]:
+                if d == curr: streak += 1; curr -= timedelta(days=1)
+                else: break
+
+    return UserStatsResponse(
+        username=current_user.username, total_reconciliations=len(completed),
+        this_week=this_week, this_month=this_month, current_streak=streak,
+        last_activity=activities[0]["timestamp"] if activities else None
     )
 
+@APP.get("/profile/activity", response_model=List[ActivityResponse])
+async def get_user_activity(current_user: UserInDB = Depends(get_current_user), limit: int = 10):
+    if not AUTH_ENABLED or activity_logs_collection is None: raise HTTPException(503, "Unavailable")
+    acts = activity_logs_collection.find({"username": current_user.username, "step_completed": 4, "success": True}, {"_id": 0, "username": 0}).sort("timestamp", -1).limit(limit)
+    return [ActivityResponse(**a) for a in acts]
+
+@APP.get("/profile/daily", response_model=List[DailyActivityResponse])
+async def get_daily_activity(current_user: UserInDB = Depends(get_current_user), days: int = 30):
+    if not AUTH_ENABLED or activity_logs_collection is None: raise HTTPException(503, "Unavailable")
+    start = datetime.utcnow() - timedelta(days=days)
+    pipeline = [
+        {"$match": {"username": current_user.username, "timestamp": {"$gte": start}, "step_completed": 4, "success": True}},
+        {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}}, "count": {"$sum": 1}}},
+        {"$sort": {"_id": 1}}
+    ]
+    results = {r["_id"]: r["count"] for r in activity_logs_collection.aggregate(pipeline)}
+    return [DailyActivityResponse(date=(datetime.utcnow() - timedelta(days=days-i-1)).strftime("%Y-%m-%d"), count=results.get((datetime.utcnow() - timedelta(days=days-i-1)).strftime("%Y-%m-%d"), 0)) for i in range(days)]
+
+@APP.get("/reconciliations/history")
+async def get_reconciliation_history(current_user: UserInDB = Depends(get_current_user), limit: int = 50, skip: int = 0):
+    if reconciliation_results_collection is None: raise HTTPException(503, "DB unavailable")
+    
+    results = list(reconciliation_results_collection.find({"username": current_user.username}, {"_id": 0}).sort("timestamp", -1).skip(skip).limit(limit))
+    
+    for r in results:
+        if "summary" not in r: r["summary"] = {}
+        s = r["summary"]
+        if "total_amount" not in s and "total_value" in s: s["total_amount"] = s["total_value"]
+        s["total_amount"] = float(s.get("total_amount", 0.0) or 0.0)
+        s["step4_outstanding"] = int(s.get("step4_outstanding", 0) or 0)
+        s["unique_patients"] = int(s.get("unique_patients", 0) or 0)
+        s["step2_matches"] = int(s.get("step2_matches", 0) or 0)
+
+    return results
+
+# ✅ RESTORED: Details Endpoint
+@APP.get("/reconciliations/{run_id}/details")
+async def get_reconciliation_details(run_id: str, current_user: UserInDB = Depends(get_current_user)):
+    if reconciliation_results_collection is None: raise HTTPException(503, "DB unavailable")
+    res = reconciliation_results_collection.find_one({"username": current_user.username, "run_id": run_id}, {"_id": 0})
+    if not res: raise HTTPException(404, "Reconciliation not found")
+    return res
+
+# ✅ RESTORED: Download ZIP Endpoint
+@APP.get("/reconciliations/{run_id}/download-zip")
+async def download_reconciliation_zip(run_id: str, current_user: UserInDB = Depends(get_current_user)):
+    if reconciliation_results_collection is None or fs is None: raise HTTPException(503, "DB unavailable")
+    from bson import ObjectId
+    
+    result = reconciliation_results_collection.find_one({"username": current_user.username, "run_id": run_id})
+    if not result: raise HTTPException(404, "Reconciliation not found")
+    if "zip_file_id" not in result: raise HTTPException(404, "ZIP file ID not found")
+
+    try:
+        zip_file = fs.get(ObjectId(result["zip_file_id"]))
+        return StreamingResponse(
+            zip_file, media_type="application/zip", 
+            headers={"Content-Disposition": f"attachment; filename={run_id}.zip"}
+        )
+    except Exception as e:
+        print(f"[Download ZIP] Error: {e}")
+        raise HTTPException(500, "Failed to retrieve file")
+
+@APP.delete("/reconciliations/{run_id}")
+async def delete_reconciliation(run_id: str, current_user: UserInDB = Depends(get_current_user)):
+    if reconciliation_results_collection is None or fs is None: raise HTTPException(503, "DB unavailable")
+    from bson import ObjectId
+    res = reconciliation_results_collection.find_one({"username": current_user.username, "run_id": run_id})
+    if not res: raise HTTPException(404, "Not found")
+    try:
+        if "zip_file_id" in res: fs.delete(ObjectId(res["zip_file_id"]))
+        reconciliation_results_collection.delete_one({"username": current_user.username, "run_id": run_id})
+        return {"status": "success"}
+    except Exception as e: raise HTTPException(500, str(e))
+
+@APP.get("/download/{run_id}/{filename}")
+async def download_file(run_id: str, filename: str, user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None):
+    file_path = RUN_ROOT / run_id / filename
+    if not file_path.exists(): raise HTTPException(404, "File not found")
+    media = "application/zip" if filename.endswith(".zip") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return StreamingResponse(open(file_path, "rb"), media_type=media, headers={"Content-Disposition": f"attachment; filename={filename}"})
+
 @APP.get("/tpa-choices")
-async def get_tpa_choices(current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None):
-    """Returns list of available TPA choices (PROTECTED)"""
+async def get_tpa_choices(user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None):
     return {"tpa_choices": TPA_CHOICES}
+
+# ----------------- RECONCILIATION FLOW -----------------
 
 @APP.post("/reconcile/step1")
 async def reconcile_step1(
@@ -925,96 +826,56 @@ async def reconcile_step1(
     advance_file: UploadFile = File(...),
     current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
 ):
-    """Step-1: Upload Bank + Advance files based on bank type (PROTECTED)"""
+    """Step-1: Ingest Bank & Advance (Excel/CSV) -> 01_bank, 02_advance"""
     global CURRENT_RUN_DIR, CURRENT_BANK_TYPE
     try:
         CURRENT_RUN_DIR = new_run_dir()
         CURRENT_BANK_TYPE = bank_type
         run_id = CURRENT_RUN_DIR.name
 
-        print(f"[Step1] Starting with bank_type={bank_type}, run_id={run_id}")
-
-        if bank_type not in ["ICICI", "AXIS"]:
-            raise HTTPException(status_code=400, detail="Invalid bank_type. Must be 'ICICI' or 'AXIS'.")
+        # ✅ RESTORED: Standardized Naming
+        bank_path = CURRENT_RUN_DIR / "bank.xlsx"
+        with open(bank_path, "wb") as f: f.write(await bank_file.read())
+        
+        adv_path = CURRENT_RUN_DIR / "advance.xlsx"
+        with open(adv_path, "wb") as f: f.write(await advance_file.read())
 
         if bank_type == "ICICI":
-            bank_path = CURRENT_RUN_DIR / "bank.xlsx"
-            with open(bank_path, "wb") as f:
-                f.write(await bank_file.read())
-            bank_path = ensure_xlsx(bank_path)
             bank_df = clean_raw_bank_statement_icici(bank_path)
-            
-            advance_path = CURRENT_RUN_DIR / "advance.pdf"
-            with open(advance_path, "wb") as f:
-                f.write(await advance_file.read())
-            adv_df = read_clean_pdf_to_df_icici_advance(advance_path)
-            if "Msg_Refer_No" not in adv_df.columns:
-                adv_df["Msg_Refer_No"] = adv_df["Refer_No_UTR"]
-            
-            out_bank = CURRENT_RUN_DIR / "01a_icici_bank_clean.xlsx"
-            out_adv = CURRENT_RUN_DIR / "01b_icici_advance_clean.xlsx"
+            adv_df = read_clean_icici_advance_excel(adv_path, deduplicate=True)
+            out_bank = save_xlsx(bank_df, CURRENT_RUN_DIR / "01a_icici_bank_clean.xlsx")
+            out_adv = save_xlsx(adv_df, CURRENT_RUN_DIR / "01b_icici_advance_clean.xlsx")
+        elif bank_type == "AXIS":
+            bank_df = clean_raw_bank_statement_axis(bank_path)
+            adv_df = read_clean_axis_advance_excel(adv_path, deduplicate=True)
+            out_bank = save_xlsx(bank_df, CURRENT_RUN_DIR / "01a_axis_bank_clean.xlsx")
+            out_adv = save_xlsx(adv_df, CURRENT_RUN_DIR / "01b_axis_advance_clean.xlsx")
         else:
-            bank_path = CURRENT_RUN_DIR / "bank.pdf"
-            with open(bank_path, "wb") as f:
-                f.write(await bank_file.read())
-            raw_axis_df, bank_df = clean_raw_bank_statement_axis_pdf(bank_path)
-            
-            advance_path = CURRENT_RUN_DIR / "advance.xlsx"
-            with open(advance_path, "wb") as f:
-                f.write(await advance_file.read())
-            advance_path = ensure_xlsx(advance_path)
-            adv_df = read_clean_axis_advance_xlsx(advance_path)
-            
-            out_bank = CURRENT_RUN_DIR / "01a_axis_bank_clean.xlsx"
-            out_adv = CURRENT_RUN_DIR / "01b_axis_advance_clean.xlsx"
-
-        save_xlsx(bank_df, out_bank)
-        save_xlsx(adv_df, out_adv)
+            raise HTTPException(400, "Invalid Bank Type. Only ICICI and AXIS are currently supported.")
         
-        print(f"[Step1] Files saved: {out_bank.name}, {out_adv.name}")
-        print(f"[Step1] Files exist: bank={out_bank.exists()}, advance={out_adv.exists()}")
-        
-        # Log activity
         if current_user:
-            log_activity(
-                username=current_user.username,
-                bank_type=bank_type,
-                step_completed=1,
-                run_id=run_id,
-                row_counts={
-                    "bank_rows": len(bank_df),
-                    "advance_rows": len(adv_df)
-                },
-                success=True
-            )
+            log_activity(current_user.username, bank_type, 1, run_id, counts={"bank": len(bank_df), "adv": len(adv_df)})
         
         return {
-            "status": "success",
-            "run_id": run_id,
-            "bank_type": bank_type,
-            "counts": {
-                "bank_rows": len(bank_df),
-                "advance_rows": len(adv_df)
-            },
+            "status": "success", "run_id": run_id,
+            "counts": {"bank_rows": len(bank_df), "advance_rows": len(adv_df)},
             "files": {
                 "bank": f"/download/{run_id}/{out_bank.name}",
                 "advance": f"/download/{run_id}/{out_adv.name}"
             }
         }
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, detail=str(e))
 
 @APP.post("/reconcile/step2")
 async def reconcile_step2(current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None):
-    """Step-2: Match Bank with Advance (no upload needed) (PROTECTED)"""
-    global CURRENT_RUN_DIR, CURRENT_BANK_TYPE
-    if CURRENT_RUN_DIR is None:
-        raise HTTPException(status_code=400, detail="Run not initialized. Complete Step-1 first.")
+    """Step-2: Match Bank & Advance -> 03a_mapped, 03b_notin"""
+    global CURRENT_RUN_DIR
+    if not CURRENT_RUN_DIR: raise HTTPException(400, "Run not initialized")
     try:
         run_id = CURRENT_RUN_DIR.name
         
+        # ✅ RESTORED: Dynamic path selection based on type
         if CURRENT_BANK_TYPE == "ICICI":
             bank_path = CURRENT_RUN_DIR / "01a_icici_bank_clean.xlsx"
             adv_path = CURRENT_RUN_DIR / "01b_icici_advance_clean.xlsx"
@@ -1023,46 +884,29 @@ async def reconcile_step2(current_user: UserInDB = Depends(get_current_user) if 
             adv_path = CURRENT_RUN_DIR / "01b_axis_advance_clean.xlsx"
         
         if not bank_path.exists() or not adv_path.exists():
-            raise HTTPException(status_code=400, detail="Step-1 outputs missing.")
-        
+            raise HTTPException(400, "Step 1 outputs missing")
+
         bank_df = pd.read_excel(bank_path, dtype=str)
         adv_df = pd.read_excel(adv_path, dtype=str)
         
-        s2_matched, s2_notin = step2_match_bank_advance(bank_df, adv_df)
+        matched, not_in = step2_match_bank_advance(bank_df, adv_df)
         
-        out2a = CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx"
-        out2b = CURRENT_RUN_DIR / "02b_bank_not_in_advance.xlsx"
-        save_xlsx(s2_matched, out2a)
-        save_xlsx(s2_notin, out2b)
+        out_match = save_xlsx(matched, CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx")
+        out_notin = save_xlsx(not_in, CURRENT_RUN_DIR / "02b_bank_not_in_advance.xlsx")
         
-        # Log activity
         if current_user:
-            log_activity(
-                username=current_user.username,
-                bank_type=CURRENT_BANK_TYPE,
-                step_completed=2,
-                run_id=run_id,
-                row_counts={
-                    "matches": len(s2_matched),
-                    "not_in": len(s2_notin)
-                },
-                success=True
-            )
-        
+            log_activity(current_user.username, CURRENT_BANK_TYPE, 2, run_id, counts={"matches": len(matched), "not_in": len(not_in)})
+
         return {
-            "status": "success",
-            "run_id": run_id,
-            "counts": {
-                "matches": len(s2_matched),
-                "not_in": len(s2_notin)
-            },
+            "status": "success", "run_id": run_id,
+            "counts": {"matches": len(matched), "not_in": len(not_in)},
             "files": {
-                "matches": f"/download/{run_id}/{out2a.name}",
-                "not_in": f"/download/{run_id}/{out2b.name}"
+                "matches": f"/download/{run_id}/{out_match.name}",
+                "not_in": f"/download/{run_id}/{out_notin.name}"
             }
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, detail=str(e))
 
 @APP.post("/reconcile/step3")
 async def reconcile_step3(
@@ -1070,521 +914,163 @@ async def reconcile_step3(
     mis_file: UploadFile = File(...),
     current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
 ):
-    """Step-3: Map to MIS with TPA selection (PROTECTED)"""
+    """Step-3: Parse MIS & Map -> 04_mis_clean, 05_mapped"""
     global CURRENT_RUN_DIR
-    if CURRENT_RUN_DIR is None:
-        raise HTTPException(status_code=400, detail="Run not initialized. Complete Step-1 & Step-2 first.")
+    if not CURRENT_RUN_DIR: raise HTTPException(400, "Run not initialized")
     try:
         run_id = CURRENT_RUN_DIR.name
+        mis_path = CURRENT_RUN_DIR / "mis.xlsx" # Standardized
+        with open(mis_path, "wb") as f: f.write(await mis_file.read())
         
-        if tpa_name not in TPA_CHOICES:
-            raise HTTPException(status_code=400, detail=f"Invalid TPA. Choose from: {TPA_CHOICES}")
+        # 1. Clean MIS (New Logic)
+        mis_clean = parse_mis_universal(mis_path, tpa_name)
+        out_mis_clean = save_xlsx(mis_clean, CURRENT_RUN_DIR / "04_mis_cleaned.xlsx")
         
-        mis_path = CURRENT_RUN_DIR / "mis.xlsx"
-        with open(mis_path, "wb") as f:
-            f.write(await mis_file.read())
-        mis_path = ensure_xlsx(mis_path)
+        # 2. Map Step 2 Matches to MIS
+        s2_path = CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx" # Correct path
+        if not s2_path.exists(): raise HTTPException(400, "Step 2 output missing")
         
-        s2_path = CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx"
-        if not s2_path.exists():
-            raise HTTPException(status_code=400, detail="Step-2 output missing.")
+        s2_df = pd.read_excel(s2_path, dtype=str)
+        s3_mapped = step3_map_to_mis(s2_df, mis_clean, tpa_name, deduplicate=True)
+        out3 = save_xlsx(s3_mapped, CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx") # Standardized name
         
-        s2_matched = pd.read_excel(s2_path, dtype=str)
-        s3 = step3_map_to_mis(s2_matched, mis_path, tpa_name)
-        
-        out3 = CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx"
-        save_xlsx(s3, out3)
-        
-        # Log activity
         if current_user:
-            log_activity(
-                username=current_user.username,
-                bank_type=CURRENT_BANK_TYPE,
-                step_completed=3,
-                run_id=run_id,
-                tpa_name=tpa_name,
-                row_counts={"rows": len(s3)},
-                success=True
-            )
-        
+            log_activity(current_user.username, CURRENT_BANK_TYPE, 3, run_id, tpa=tpa_name, counts={"mapped": len(s3_mapped)})
+
         return {
-            "status": "success",
-            "run_id": run_id,
-            "tpa_name": tpa_name,
-            "counts": {
-                "rows": len(s3)
-            },
+            "status": "success", "run_id": run_id, "tpa_name": tpa_name,
+            "counts": {"rows": len(s3_mapped)},
             "files": {
-                "mis": f"/download/{run_id}/{out3.name}"
+                "mis_cleaned": f"/download/{run_id}/{out_mis_clean.name}",
+                "mapped": f"/download/{run_id}/{out3.name}"
             }
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, detail=str(e))
 
 @APP.post("/reconcile/step4")
 async def reconcile_step4(
     outstanding_file: UploadFile = File(...),
     current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
 ):
-    """Step-4: Outstanding match and create ZIP (PROTECTED)"""
-    global CURRENT_RUN_DIR
-    if CURRENT_RUN_DIR is None:
-        raise HTTPException(status_code=400, detail="Run not initialized. Complete previous steps first.")
+    """Step-4: Parse Outstanding & Final Match (Claim No) -> 06_out_clean, 07_final"""
+    global CURRENT_RUN_DIR, CURRENT_BANK_TYPE
+    if not CURRENT_RUN_DIR: raise HTTPException(400, "Run not initialized")
     try:
         run_id = CURRENT_RUN_DIR.name
+        out_path = CURRENT_RUN_DIR / "outstanding.xlsx" # Standardized
+        with open(out_path, "wb") as f: f.write(await outstanding_file.read())
         
-        out_path = CURRENT_RUN_DIR / "outstanding.xlsx"
-        with open(out_path, "wb") as f:
-            f.write(await outstanding_file.read())
-        out_path = ensure_xlsx(out_path)
+        # 1. Clean Outstanding
+        out_clean = parse_outstanding_excel_to_clean(out_path)
+        out_clean_path = save_xlsx(out_clean, CURRENT_RUN_DIR / "06_outstanding_cleaned.xlsx")
         
+        # 2. Final Strict Match
         s3_path = CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx"
-        if not s3_path.exists():
-            raise HTTPException(status_code=400, detail="Step-3 output missing.")
+        if not s3_path.exists(): raise HTTPException(400, "Step 3 output not found")
         
-        s3 = pd.read_excel(s3_path, dtype=str)
-        s4 = step4_strict_matches(s3, out_path)
+        s3_df = pd.read_excel(s3_path, dtype=str)
+        final_matched, final_unmatched = step4_strict_matches(s3_df, out_path, deduplicate=True)
         
-        out4 = CURRENT_RUN_DIR / "04_outstanding_matches.xlsx"
-        save_xlsx(s4, out4)
+        out_final = save_xlsx(final_matched, CURRENT_RUN_DIR / "04_outstanding_matches.xlsx") # Standardized name
+        out_unmatched = save_xlsx(final_unmatched, CURRENT_RUN_DIR / "07b_final_unmatched_in_outstanding.xlsx")
         
-        all_outputs = list(CURRENT_RUN_DIR.glob("0*.xlsx"))
+        # Zip all outputs
+        all_outputs = sorted(list(CURRENT_RUN_DIR.glob("0*.xlsx")))
         zip_path = CURRENT_RUN_DIR / f"{run_id}.zip"
         zip_outputs(all_outputs, zip_path)
         
-        # Collect comprehensive row counts from all steps
-        comprehensive_counts = {
-            "outstanding_matches": len(s4)
-        }
-        
-        # Try to get counts from previous steps
-        try:
-            # Step 1 counts
-            step1_bank = CURRENT_RUN_DIR / f"01a_{CURRENT_BANK_TYPE.lower()}_bank_clean.xlsx"
-            step1_adv = CURRENT_RUN_DIR / f"01b_{CURRENT_BANK_TYPE.lower()}_advance_clean.xlsx"
-            if step1_bank.exists():
-                comprehensive_counts["bank_rows"] = len(pd.read_excel(step1_bank, dtype=str))
-            if step1_adv.exists():
-                comprehensive_counts["advance_rows"] = len(pd.read_excel(step1_adv, dtype=str))
-            
-            # Step 2 counts
-            step2_match = CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx"
-            step2_notin = CURRENT_RUN_DIR / "02b_bank_not_in_advance.xlsx"
-            if step2_match.exists():
-                comprehensive_counts["bank_advance_matches"] = len(pd.read_excel(step2_match, dtype=str))
-            if step2_notin.exists():
-                comprehensive_counts["not_in_advance"] = len(pd.read_excel(step2_notin, dtype=str))
-            
-            # Step 3 counts
-            step3_mis = CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx"
-            if step3_mis.exists():
-                comprehensive_counts["mis_mapped"] = len(pd.read_excel(step3_mis, dtype=str))
-        except Exception as e:
-            print(f"[Step4] Warning: Could not collect all row counts: {e}")
-        
-
-        # âœ… NEW: Save reconciliation result to MongoDB
+        # --- DB STORAGE LOGIC (Aligned & Safe) ---
         if current_user and reconciliation_results_collection is not None and fs is not None:
             try:
-                from bson import ObjectId
+                with open(zip_path, "rb") as zf:
+                    fid = fs.put(zf, filename=f"{run_id}.zip", username=current_user.username)
                 
-                # Read ZIP file and store in GridFS
-                with open(zip_path, "rb") as zip_file:
-                    zip_file_id = fs.put(
-                        zip_file,
-                        filename=f"{run_id}.zip",
-                        username=current_user.username,
-                        content_type="application/zip"
+                tpa = "Unknown"
+                if activity_logs_collection is not None:
+                    last_act = activity_logs_collection.find_one(
+                        {"username": current_user.username, "run_id": run_id, "step_completed": 3},
+                        sort=[("timestamp", -1)]
                     )
-                
-                # Calculate summary
+                    if last_act and "tpa_name" in last_act:
+                        tpa = last_act["tpa_name"]
+
                 total_amount = 0.0
+                if "Settled Amount" in final_matched.columns:
+                    total_amount = final_matched["Settled Amount"].apply(_to_amt).sum()
+                elif "Amount" in final_matched.columns:
+                    total_amount = final_matched["Amount"].apply(_to_amt).sum()
+                
+                # ✅ RESTORED: Detailed counts for History
+                comp_counts = {"step4_outstanding": len(final_matched)}
+                try:
+                    # Step 1
+                    s1b = CURRENT_RUN_DIR / (f"01a_{CURRENT_BANK_TYPE.lower()}_bank_clean.xlsx")
+                    s1a = CURRENT_RUN_DIR / (f"01b_{CURRENT_BANK_TYPE.lower()}_advance_clean.xlsx")
+                    if s1b.exists(): comp_counts["step1_bank_rows"] = len(pd.read_excel(s1b))
+                    if s1a.exists(): comp_counts["step1_advance_rows"] = len(pd.read_excel(s1a))
+                    
+                    # Step 2
+                    s2_match = CURRENT_RUN_DIR / "02a_bank_x_advance_matches.xlsx"
+                    s2_notin = CURRENT_RUN_DIR / "02b_bank_not_in_advance.xlsx"
+                    if s2_match.exists(): comp_counts["step2_matches"] = len(pd.read_excel(s2_match))
+                    if s2_notin.exists(): comp_counts["step2_not_in"] = len(pd.read_excel(s2_notin))
+                    
+                    # Step 3
+                    s3_mis = CURRENT_RUN_DIR / "03_matches_mapped_to_mis.xlsx"
+                    if s3_mis.exists(): comp_counts["step3_mis_mapped"] = len(pd.read_excel(s3_mis))
+                except: pass
+
                 unique_patients = 0
-                if len(s4) > 0:
-                    if "Settled Amount" in s4.columns:
-                        total_amount = float(s4["Settled Amount"].apply(_to_amt).sum())
-                    if "Patient Name" in s4.columns:
-                        unique_patients = len(s4["Patient Name"].unique())
-                
-                # Get TPA name from Step 3 activity logs
-                last_activity = activity_logs_collection.find_one(
-                    {"username": current_user.username, "run_id": run_id, "step_completed": 3},
-                    sort=[("timestamp", -1)]
-                )
-                tpa_name = last_activity.get("tpa_name") if last_activity else None
-                
-                # Create result document
-                result_doc = {
+                if "Patient Name" in final_matched.columns:
+                    unique_patients = len(final_matched["Patient Name"].unique())
+
+                rec_doc = {
                     "username": current_user.username,
                     "run_id": run_id,
                     "timestamp": datetime.utcnow(),
-                    "bank_type": CURRENT_BANK_TYPE,
-                    "tpa_name": tpa_name,
+                    "created_at": datetime.utcnow(),
+                    "bank_type": CURRENT_BANK_TYPE or "Unknown",
+                    "tpa_name": tpa,
+                    "status": "Completed",
                     "summary": {
-                        "step1_bank_rows": comprehensive_counts.get("bank_rows", 0),
-                        "step1_advance_rows": comprehensive_counts.get("advance_rows", 0),
-                        "step2_matches": comprehensive_counts.get("bank_advance_matches", 0),
-                        "step2_not_in": comprehensive_counts.get("not_in_advance", 0),
-                        "step3_mis_mapped": comprehensive_counts.get("mis_mapped", 0),
-                        "step4_outstanding": len(s4),
-                        "total_amount": total_amount,
-                        "unique_patients": unique_patients
+                        "step4_outstanding": int(len(final_matched)),
+                        "total_amount": float(total_amount),
+                        "unique_patients": int(unique_patients),
+                        "step2_matches": int(comp_counts.get("step2_matches", 0)),
+                        "step2_not_in": int(comp_counts.get("step2_not_in", 0)),
+                        "step1_bank_rows": int(comp_counts.get("step1_bank_rows", 0)),
+                        "step1_advance_rows": int(comp_counts.get("step1_advance_rows", 0)),
+                        "step3_mis_mapped": int(comp_counts.get("step3_mis_mapped", 0)),
+                        "unmatched_count": int(len(final_unmatched))
                     },
-                    "zip_file_id": str(zip_file_id)
+                    "zip_file_id": str(fid)
                 }
                 
-                reconciliation_results_collection.insert_one(result_doc)
-                print(f"[Step4] âœ… Saved reconciliation result to MongoDB: {run_id}")
-                
+                reconciliation_results_collection.insert_one(rec_doc)
+                print(f"[DB] Saved history for {run_id}")
+
             except Exception as e:
-                print(f"[Step4] âš ï¸ Failed to save to MongoDB: {e}")
-                # Don't fail the request if storage fails
-        
-        # Log activity - Step 4 completes the reconciliation
+                print(f"[DB Save Error] {str(e)}")
+
         if current_user:
-            log_activity(
-                username=current_user.username,
-                bank_type=CURRENT_BANK_TYPE,
-                step_completed=4,
-                run_id=run_id,
-                row_counts=comprehensive_counts,
-                success=True
-            )
-        
+            log_activity(current_user.username, CURRENT_BANK_TYPE, 4, run_id, counts={"final": len(final_matched)})
+
         return {
-            "status": "success",
+            "status": "success", 
             "run_id": run_id,
             "counts": {
-                "rows": len(s4)
+                "rows": len(final_matched),
+                "unmatched": len(final_unmatched)
             },
             "files": {
-                "outstanding": f"/download/{run_id}/{out4.name}",
+                "outstanding_cleaned": f"/download/{run_id}/{out_clean_path.name}",
+                "final_matches": f"/download/{run_id}/{out_final.name}",
+                "final_unmatched": f"/download/{run_id}/{out_unmatched.name}",
                 "zip": f"/download/{run_id}/{zip_path.name}"
             }
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-# ==================== USER PROFILE & ACTIVITY ENDPOINTS ====================
-
-@APP.post("/auth/change-password")
-async def change_password(
-    current_password: str = Form(...),
-    new_password: str = Form(...),
-    current_user: UserInDB = Depends(get_current_user)
-):
-    """
-    Change user's password
-    
-    Form Data:
-    - current_password: Current password for verification
-    - new_password: New password (min 6 chars)
-    """
-    if not AUTH_ENABLED or users_collection is None:
-        raise HTTPException(status_code=503, detail="Authentication is not configured")
-    
-    # Verify current password
-    from auth import verify_password, get_password_hash
-    
-    if not verify_password(current_password, current_user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Current password is incorrect"
-        )
-    
-    # Validate new password length
-    if len(new_password) < 6:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New password must be at least 6 characters"
-        )
-    
-    # Hash and update password
-    try:
-        new_hashed_password = get_password_hash(new_password)
-        
-        result = users_collection.update_one(
-            {"username": current_user.username},
-            {"$set": {"hashed_password": new_hashed_password}}
-        )
-        
-        if result.modified_count == 0:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update password"
-            )
-        
-        print(f"[Password Change] ✅ Password updated for user: {current_user.username}")
-        
-        return {
-            "status": "success",
-            "message": "Password changed successfully"
-        }
-    except Exception as e:
-        print(f"[Password Change] Error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to change password: {str(e)}"
-        )
-
-@APP.get("/profile/stats", response_model=UserStatsResponse)
-async def get_user_stats(current_user: UserInDB = Depends(get_current_user)):
-    """Get user statistics and activity summary"""
-    if not AUTH_ENABLED or activity_logs_collection is None:
-        raise HTTPException(status_code=503, detail="Profile features not available")
-    
-    username = current_user.username
-    
-    # Get all activities for user
-    activities = list(activity_logs_collection.find(
-        {"username": username, "success": True},
-        {"_id": 0}
-    ).sort("timestamp", -1))
-    
-    if not activities:
-        return UserStatsResponse(
-            username=username,
-            total_reconciliations=0,
-            this_week=0,
-            this_month=0,
-            current_streak=0,
-            last_activity=None
-        )
-    
-    now = datetime.utcnow()
-    week_ago = now - timedelta(days=7)
-    month_ago = now - timedelta(days=30)
-    
-    # Count reconciliations (step 4 completions)
-    completed = [a for a in activities if a.get("step_completed") == 4]
-    total = len(completed)
-    this_week = len([a for a in completed if a["timestamp"] >= week_ago])
-    this_month = len([a for a in completed if a["timestamp"] >= month_ago])
-    
-    # Calculate streak (consecutive days with at least 1 completion)
-    streak = 0
-    if completed:
-        sorted_dates = sorted(set(
-            a["timestamp"].date() for a in completed
-        ), reverse=True)
-        
-        yesterday = now.date() - timedelta(days=1)
-        today = now.date()
-        
-        # Start from today or yesterday
-        if sorted_dates and sorted_dates[0] in [today, yesterday]:
-            streak = 1
-            current_date = sorted_dates[0] - timedelta(days=1)
-            
-            for date in sorted_dates[1:]:
-                if date == current_date:
-                    streak += 1
-                    current_date -= timedelta(days=1)
-                else:
-                    break
-    
-    last_activity = activities[0]["timestamp"] if activities else None
-    
-    return UserStatsResponse(
-        username=username,
-        total_reconciliations=total,
-        this_week=this_week,
-        this_month=this_month,
-        current_streak=streak,
-        last_activity=last_activity
-    )
-
-@APP.get("/profile/activity", response_model=List[ActivityResponse])
-async def get_user_activity(
-    current_user: UserInDB = Depends(get_current_user),
-    limit: int = 10
-):
-    """Get recent completed reconciliations (Step 4 only)"""
-    if not AUTH_ENABLED or activity_logs_collection is None:
-        raise HTTPException(status_code=503, detail="Profile features not available")
-    
-    # Only return Step 4 completions (completed reconciliations)
-    activities = list(activity_logs_collection.find(
-        {
-            "username": current_user.username,
-            "step_completed": 4,
-            "success": True
-        },
-        {"_id": 0, "username": 0}
-    ).sort("timestamp", -1).limit(limit))
-    
-    return [ActivityResponse(**a) for a in activities]
-
-@APP.get("/profile/daily", response_model=List[DailyActivityResponse])
-async def get_daily_activity(
-    current_user: UserInDB = Depends(get_current_user),
-    days: int = 30
-):
-    """Get daily activity aggregation for charts"""
-    if not AUTH_ENABLED or activity_logs_collection is None:
-        raise HTTPException(status_code=503, detail="Profile features not available")
-    
-    start_date = datetime.utcnow() - timedelta(days=days)
-    
-    # Aggregate by date
-    pipeline = [
-        {
-            "$match": {
-                "username": current_user.username,
-                "timestamp": {"$gte": start_date},
-                "step_completed": 4,  # Only count completed reconciliations
-                "success": True
-            }
-        },
-        {
-            "$group": {
-                "_id": {
-                    "$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}
-                },
-                "count": {"$sum": 1}
-            }
-        },
-        {
-            "$sort": {"_id": 1}
-        }
-    ]
-    
-    results = list(activity_logs_collection.aggregate(pipeline))
-    
-    # Fill in missing dates with 0 count
-    date_counts = {r["_id"]: r["count"] for r in results}
-    all_dates = []
-    
-    for i in range(days):
-        date = (datetime.utcnow() - timedelta(days=days - i - 1)).strftime("%Y-%m-%d")
-        all_dates.append(DailyActivityResponse(
-            date=date,
-            count=date_counts.get(date, 0)
-        ))
-    
-    return all_dates
-# ==================== RECONCILIATION HISTORY ENDPOINTS ====================
-
-@APP.get("/reconciliations/history")
-async def get_reconciliation_history(
-    current_user: UserInDB = Depends(get_current_user),
-    limit: int = 50,
-    skip: int = 0
-):
-    """Get user's reconciliation history with download links"""
-    if reconciliation_results_collection is None:
-        raise HTTPException(status_code=503, detail="Database not connected")
-    
-    results = list(reconciliation_results_collection.find(
-        {"username": current_user.username},
-        {"_id": 0}  # Exclude MongoDB _id
-    ).sort("timestamp", -1).skip(skip).limit(limit))
-    
-    return results
-
-@APP.get("/reconciliations/{run_id}/details")
-async def get_reconciliation_details(
-    run_id: str,
-    current_user: UserInDB = Depends(get_current_user)
-):
-    """Get details of a specific reconciliation"""
-    if reconciliation_results_collection is None:
-        raise HTTPException(status_code=503, detail="Database not connected")
-    
-    result = reconciliation_results_collection.find_one(
-        {
-            "username": current_user.username,
-            "run_id": run_id
-        },
-        {"_id": 0}
-    )
-    
-    if not result:
-        raise HTTPException(status_code=404, detail="Reconciliation not found")
-    
-    return result
-
-@APP.get("/reconciliations/{run_id}/download-zip")
-async def download_reconciliation_zip(
-    run_id: str,
-    current_user: UserInDB = Depends(get_current_user)
-):
-    """Download ZIP file from past reconciliation"""
-    if reconciliation_results_collection is None or fs is None:
-        raise HTTPException(status_code=503, detail="Database not connected")
-    
-    from bson import ObjectId
-    from bson.errors import InvalidId
-    
-    # Find the reconciliation result
-    result = reconciliation_results_collection.find_one(
-        {
-            "username": current_user.username,
-            "run_id": run_id
-        }
-    )
-    
-    if not result:
-        raise HTTPException(status_code=404, detail="Reconciliation not found")
-    
-    # Get ZIP file from GridFS
-    try:
-        zip_file_id = ObjectId(result["zip_file_id"])
-        zip_file = fs.get(zip_file_id)
-        
-        def file_iterator():
-            yield zip_file.read()
-        
-        return StreamingResponse(
-            file_iterator(),
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": f"attachment; filename={run_id}.zip",
-                "Content-Type": "application/zip"
-            }
-        )
-    except InvalidId:
-        raise HTTPException(status_code=404, detail="Invalid file ID")
-    except Exception as e:
-        print(f"[Download ZIP] Error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve file")
-
-@APP.delete("/reconciliations/{run_id}")
-async def delete_reconciliation(
-    run_id: str,
-    current_user: UserInDB = Depends(get_current_user)
-):
-    """Delete a reconciliation and its files"""
-    if reconciliation_results_collection is None or fs is None:
-        raise HTTPException(status_code=503, detail="Database not connected")
-    
-    from bson import ObjectId
-    
-    # Find the reconciliation
-    result = reconciliation_results_collection.find_one(
-        {
-            "username": current_user.username,
-            "run_id": run_id
-        }
-    )
-    
-    if not result:
-        raise HTTPException(status_code=404, detail="Reconciliation not found")
-    
-    try:
-        # Delete GridFS file
-        zip_file_id = ObjectId(result["zip_file_id"])
-        fs.delete(zip_file_id)
-        
-        # Delete reconciliation document
-        reconciliation_results_collection.delete_one(
-            {
-                "username": current_user.username,
-                "run_id": run_id
-            }
-        )
-        
-        print(f"[Delete] âœ… Deleted reconciliation: {run_id}")
-        return {"status": "success", "message": "Reconciliation deleted"}
-    except Exception as e:
-        print(f"[Delete] Error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete reconciliation")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(400, detail=str(e))
