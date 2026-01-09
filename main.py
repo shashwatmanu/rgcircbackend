@@ -49,7 +49,8 @@ ALLOWED_ORIGINS_STR = os.getenv(
     "CORS_ALLOW_ORIGINS",
     "http://localhost:3000,https://recondb.vercel.app,https://www.recowiz.in,http://www.recowiz.in,https://recowiz.in,http://recowiz.in,http://127.0.0.1:3000,http://127.0.0.1:8000"
 )
-ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]
+ALLOWED_ORIGINS = [origin.strip().rstrip("/") for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]
+print(f"[CORS] Configured Allowed Origins: {ALLOWED_ORIGINS}")
 
 APP.add_middleware(
     CORSMiddleware,
