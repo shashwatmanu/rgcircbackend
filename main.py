@@ -47,7 +47,7 @@ APP = FastAPI(title="Recon Backend v17.10 (Duplicate Header Fix)", version="1.10
 # ==========================================
 ALLOWED_ORIGINS = os.getenv(
     "CORS_ALLOW_ORIGINS",
-    "http://localhost:3000,https://recondb.vercel.app,https://www.recowiz.in,http://www.recowiz.in,http://127.0.0.1:3000,http://127.0.0.1:8000"
+    "http://localhost:3000,https://recondb.vercel.app,https://www.recowiz.in,http://www.recowiz.in,https://recowiz.in,http://recowiz.in,http://127.0.0.1:3000,http://127.0.0.1:8000"
 ).split(",")
 
 APP.add_middleware(
