@@ -1031,11 +1031,16 @@ def parse_outstanding_excel_to_clean_v2(xlsx_path: Path) -> pd.DataFrame:
     for c in df.columns: df[c] = df[c].astype(str).str.replace("\xa0", " ", regex=False).str.strip()
     return df.reset_index(drop=True)
 
-def step4_strict_matches_v2(step3_df: pd.DataFrame, outstanding_path: Path, deduplicate: bool = True):
+def step4_strict_matches_v2(step3_df: pd.DataFrame, outstanding_path: Optional[Path] = None, outstanding_df: Optional[pd.DataFrame] = None, deduplicate: bool = True):
     if step3_df.empty: return pd.DataFrame(), pd.DataFrame()
     if "Claim No" not in step3_df.columns: raise ValueError("Step 3 missing Claim No")
     
-    out = parse_outstanding_excel_to_clean_v2(outstanding_path).copy()
+    if outstanding_df is not None:
+        out = outstanding_df.copy()
+    elif outstanding_path:
+        out = parse_outstanding_excel_to_clean_v2(outstanding_path).copy()
+    else:
+        raise ValueError("Either outstanding_path or outstanding_df must be provided")
     if "Claim No" in out.columns: out = out.rename(columns={"Claim No": "Claim No_out"})
     
     def _clean_claim(val):
@@ -1292,12 +1297,12 @@ async def delete_reconciliation(run_id: str, current_user: UserInDB = Depends(ge
         return {"status": "success"}
     except Exception as e: raise HTTPException(500, str(e))
 
-@APP.get("/download/{run_id}/{filename}")
+@APP.get("/download/{run_id}/{filename:path}")
 async def download_file(run_id: str, filename: str, user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None):
     file_path = RUN_ROOT / run_id / filename
     if not file_path.exists(): raise HTTPException(404, "File not found")
     media = "application/zip" if filename.endswith(".zip") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    return StreamingResponse(open(file_path, "rb"), media_type=media, headers={"Content-Disposition": f"attachment; filename={filename}"})
+    return StreamingResponse(open(file_path, "rb"), media_type=media, headers={"Content-Disposition": f"attachment; filename={file_path.name}"})
 
 @APP.get("/tpa-choices")
 async def get_tpa_choices(user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None):
@@ -1734,4 +1739,154 @@ async def reconcile_v2_step3(
         }
 
     except Exception as e:
+        raise HTTPException(400, detail=str(e))
+
+@APP.post("/reconcile/v2/bulk")
+async def reconcile_v2_bulk(
+    bank_files: List[UploadFile] = File(...),
+    mis_files: List[UploadFile] = File(...),
+    outstanding_file: UploadFile = File(...),
+    current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
+):
+    """V2 Bulk: Process multiple Bank files x multiple MIS files against one Outstanding file"""
+    global CURRENT_RUN_DIR
+    try:
+        CURRENT_RUN_DIR = new_run_dir()
+        run_id = CURRENT_RUN_DIR.name
+        
+        # 1. Outstanding Processing (Once)
+        out_path = CURRENT_RUN_DIR / "outstanding.xlsx"
+        with open(out_path, "wb") as f: f.write(await outstanding_file.read())
+        
+        out_clean_df = parse_outstanding_excel_to_clean_v2(out_path)
+        save_xlsx(out_clean_df, CURRENT_RUN_DIR / "00_outstanding_cleaned.xlsx")
+        
+        summary_rows = []
+        files_resp = {}  # Map of "filename" -> "download_url"
+
+        # Helper to register file
+        def _reg_file(abs_path: Path):
+            rel_path = abs_path.relative_to(CURRENT_RUN_DIR)
+            # Encode path separators for URL if needed, but here we just pass the relative path string
+            # The download endpoint now handles "filename:path" so slashes are fine
+            files_resp[str(rel_path)] = f"/download/{run_id}/{str(rel_path)}"
+            return str(rel_path)
+        
+        # Register global files
+        _reg_file(CURRENT_RUN_DIR / "00_outstanding_cleaned.xlsx")
+
+        # Save MIS files locally first to avoid repeated reading/seeking issues
+        mis_paths = []
+        for mf in mis_files:
+            m_path = CURRENT_RUN_DIR / f"raw_mis_{mf.filename}"
+            with open(m_path, "wb") as f: 
+                mf.file.seek(0)
+                f.write(mf.file.read())
+            mis_paths.append((mf.filename, m_path))
+
+        # 2. Iterate Banks
+        for b_idx, bank_file in enumerate(bank_files):
+            b_name = Path(bank_file.filename).stem
+            b_path = CURRENT_RUN_DIR / f"bank_{b_idx}_{b_name}.xlsx"
+            with open(b_path, "wb") as f: 
+                bank_file.file.seek(0)
+                f.write(bank_file.file.read())
+            
+            try:
+                # Detect & Clean Bank
+                b_type = detect_bank_type(b_path)
+                if b_type == "ICICI":
+                    bank_clean = clean_raw_bank_statement_icici_v2(b_path)
+                else:
+                    bank_clean = clean_raw_bank_statement_axis_v2(b_path)
+                
+                # 3. Iterate MIS
+                for m_filename, m_path in mis_paths:
+                    m_stem = Path(m_filename).stem
+                    pair_id = f"{b_name}_vs_{m_stem}"
+                    pair_dir = CURRENT_RUN_DIR / pair_id
+                    pair_dir.mkdir(exist_ok=True)
+                    
+                    try:
+                        # Detect TPA & Clean
+                        tpa = detect_tpa_choice(m_path)
+                        mis_clean_df = parse_mis_universal_v2(m_path, tpa)
+                        
+                        # Step 2 Match
+                        step2_match, _ = step2_match_bank_mis_by_utr_v2(bank_clean, mis_clean_df, tpa)
+                        
+                        # Step 4 Match (Strict)
+                        final_match, final_unmatched = step4_strict_matches_v2(step2_match, outstanding_df=out_clean_df)
+                        
+                        # Save Outputs
+                        p_bank = save_xlsx(bank_clean, pair_dir / "01_bank_clean.xlsx")
+                        p_mis = save_xlsx(mis_clean_df, pair_dir / "02_mis_clean.xlsx")
+                        p_s2 = save_xlsx(step2_match, pair_dir / "03_step2_matches.xlsx")
+                        p_final = save_xlsx(final_match, pair_dir / "04_final_matches.xlsx")
+                        p_unmatched = save_xlsx(final_unmatched, pair_dir / "05_final_unmatched.xlsx")
+                        
+                        # Register files for this pair
+                        prod_files = {
+                            "Bank Cleaned": _reg_file(p_bank),
+                            "MIS Cleaned": _reg_file(p_mis),
+                            "Step 2 Match": _reg_file(p_s2),
+                            "Final Match": _reg_file(p_final),
+                            "Final Unmatched": _reg_file(p_unmatched)
+                        }
+
+                        summary_rows.append({
+                            "Bank File": bank_file.filename,
+                            "MIS File": m_filename,
+                            "Bank Type": b_type,
+                            "TPA": tpa,
+                            "Bank Rows": len(bank_clean),
+                            "MIS Rows": len(mis_clean_df),
+                            "Step 2 Match": len(step2_match),
+                            "Final Match": len(final_match),
+                            "Status": "Success",
+                            "produced_files": prod_files
+                        })
+                        
+                    except Exception as e:
+                        summary_rows.append({
+                            "Bank File": bank_file.filename,
+                            "MIS File": m_filename,
+                            "Error": str(e),
+                            "Status": "Failed",
+                            "produced_files": {}
+                        })
+            
+            except Exception as e:
+                 # Bank failure
+                 summary_rows.append({
+                    "Bank File": bank_file.filename,
+                    "Error": f"Bank Processing Failed: {str(e)}",
+                    "Status": "Failed",
+                    "produced_files": {}
+                })
+
+        # Save Summary
+        pd.DataFrame(summary_rows).to_excel(CURRENT_RUN_DIR / "bulk_summary.xlsx", index=False)
+        _reg_file(CURRENT_RUN_DIR / "bulk_summary.xlsx")
+        
+        # Create Zip Archive recursively (safe from recursion)
+        zip_temp = RUN_ROOT / f"temp_bulk_{run_id}"
+        shutil.make_archive(str(zip_temp), 'zip', CURRENT_RUN_DIR)
+        final_zip_name = f"bulk_{run_id}.zip"
+        shutil.move(str(zip_temp) + ".zip", CURRENT_RUN_DIR / final_zip_name)
+        
+        # Register Zip
+        files_resp[final_zip_name] = f"/download/{run_id}/{final_zip_name}"
+        
+        return {
+            "status": "success",
+            "run_id": run_id,
+            "summary": summary_rows,
+            "files": files_resp,
+            "zip_url": f"/download/{run_id}/{final_zip_name}"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(400, detail=str(e))
