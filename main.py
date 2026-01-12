@@ -140,35 +140,35 @@ TPA_MIS_MAPS_V2 = {
     },
     "HEALTH INDIA INSURANCE TPA SERVICES PRIVATE LTD.": {
         "Cheque/ NEFT/ UTR No.": "utrnumber",
-        "Claim No": "Claim Number"
+        "Claim No": "CCN"
     },
-    "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED": {
-        "Cheque/ NEFT/ UTR No.": "UTR No",
-        "Claim No": "REF_CCN"
-    },
-    "MEDSAVE HEALTHCARE TPA PVT LTD": {
-        "Cheque/ NEFT/ UTR No.": "UTR/Chq No.",
-        "Claim No": "Claim Number"
-    },
-    "PARAMOUNT HEALTHCARE": {
-        "Cheque/ NEFT/ UTR No.": "UTR_NO",
-        "Claim No": "Claim Number"
-    },
+    # "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED": {
+    #     "Cheque/ NEFT/ UTR No.": "UTR No",
+    #     "Claim No": "REF_CCN"
+    # },
+    # "MEDSAVE HEALTHCARE TPA PVT LTD": {
+    #     "Cheque/ NEFT/ UTR No.": "UTR/Chq No.",
+    #     "Claim No": "Claim Number"
+    # },
+    # "PARAMOUNT HEALTHCARE": {
+    #     "Cheque/ NEFT/ UTR No.": "UTR_NO",
+    #     "Claim No": "Claim Number"
+    # },
     "PARK MEDICLAIM INSURANCE TPA PRIVATE LIMITED": {
         "Cheque/ NEFT/ UTR No.": "Chq No",
         "Claim No": "Claim Number"
     },
     "SAFEWAY INSURANCE TPA PVT.LTD": {
         "Cheque/ NEFT/ UTR No.": "'Chequeno",
-        "Claim No": "Claim Number"
+        "Claim No": "ClaimNo"
     },
-    "STAR HEALTH & ALLIED HEALTH INSURANCE CO.LTD.": {
-        "Cheque/ NEFT/ UTR No.": "UTR",
-        "Claim No": "Claim ID"
-    },
+    # "STAR HEALTH & ALLIED HEALTH INSURANCE CO.LTD.": {
+    #     "Cheque/ NEFT/ UTR No.": "UTR",
+    #     "Claim No": "Claim ID"
+    # },
     "ADITYA BIRLA": {
         "Cheque/ NEFT/ UTR No.": "UTR Number",
-        "Claim No": "Claim Number"
+        "Claim No": "CLAIM NO."
     },
     "FHPL": {
         "Cheque/ NEFT/ UTR No.": "Cheque/NEFT No",
@@ -178,13 +178,25 @@ TPA_MIS_MAPS_V2 = {
         "Cheque/ NEFT/ UTR No.": "Cheque/Ref No. Insured",
         "Claim No": "Claim No."
     },
-    "GOOD HEALTH": {
-        "Cheque/ NEFT/ UTR No.": "TRASACTION_NO",
-        "Claim No": "CCN_NO"
-    },
+    # "GOOD HEALTH": {
+    #     "Cheque/ NEFT/ UTR No.": "TRASACTION_NO",
+    #     "Claim No": "CCN_NO"
+    # },
     "VOLO HEALTH INSURANCE TPA PVT.LTD (EWA) (Mail Extract)": {
         "Cheque/ NEFT/ UTR No.": "UTR Number",
         "Claim No": "Alternate Claim Id"
+    },
+    "ERICSON": {
+        "Cheque/ NEFT/ UTR No.": "UTRNo",
+        "Claim No": "ClaimId"
+    },
+    "ICICI LOMBARD": {
+        "Cheque/ NEFT/ UTR No.": "Claim-Cheque Number",
+        "Claim No": "Claim Number"
+    },
+    "RELIANCE": {
+        "Cheque/ NEFT/ UTR No.": "Map Cheque/Neft Number",
+        "Claim No": "Claim Number"
     }
 }
 
@@ -500,9 +512,21 @@ def step2_match_bank_advance(bank_df: pd.DataFrame, adv_df: pd.DataFrame):
             
     if not parts: return pd.DataFrame(), bank_df
     
-    matched = pd.concat(parts, ignore_index=True).merge(
-        adv_df, left_on="Matched_Key", right_on="Msg_Refer_No", how="inner", suffixes=("_bank", "_adv")
-    ).drop_duplicates()
+    # Enforce 1-to-1: Deduplicate matches on Bank side and Advance side before merging
+    bank_matched = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["Matched_Key"])
+    # ALLOW multiple claims per UTR: Deduplicate on UTR + Claim keys
+    # Note: 'Msg_Refer_No' is used as UTR, 'Refer_No_UTR' is used as Claim/Reference
+    cols = adv_df.columns
+    dedupe_subset = ["Msg_Refer_No"]
+    if "Refer_No_UTR" in cols: dedupe_subset.append("Refer_No_UTR")
+    
+    adv_dedup = adv_df.drop_duplicates(subset=dedupe_subset)
+
+    matched = bank_matched.merge(
+        adv_dedup, left_on="Matched_Key", right_on="Msg_Refer_No", how="inner", suffixes=("_bank", "_adv")
+    )
+    # .drop_duplicates() matched is now redundant but kept for safety if needed, though uniqueness is now guaranteed by keys
+    matched = matched.drop_duplicates()
 
     if "Transaction ID" in bank_df.columns and "Transaction ID" in matched.columns:
         not_in = bank_df.loc[~bank_df["Transaction ID"].isin(matched["Transaction ID"])]
@@ -574,6 +598,22 @@ def step3_map_to_mis(step2_df: pd.DataFrame, mis_df: pd.DataFrame, tpa_name: str
     s2 = s2.dropna(subset=["Refer_No_UTR"])
     mis_std = mis_std.dropna(subset=["Cheque/ NEFT/ UTR No."])
     
+    # Enforce 1-to-1 logic but preserve multi-claim UTRs
+    # s2 (Bank+Advance) might have multple rows per UTR (different claims)
+    # merged against MIS (UTR).
+    
+    # For s2: Relax deduplication to include Claim ID if possible, or just drop perfect duplicates
+    # s2 uses 'Refer_No_UTR' as join key (presumably UTR in this context per existing logic)
+    # But usually 'Refer_No_UTR' is Claim. If logic treats it as UTR, we must respect it.
+    # To be safe and preserve multiple rows, we drop exact duplicates only if we can't be sure of Claim col.
+    # The user instruction is (UTR, Claim No).
+    s2 = s2.drop_duplicates() 
+
+    # For MIS: Deduplicate on UTR + Claim No
+    mis_dedup_cols = ["Cheque/ NEFT/ UTR No."]
+    if "Claim No" in mis_std.columns: mis_dedup_cols.append("Claim No")
+    mis_std = mis_std.drop_duplicates(subset=mis_dedup_cols)
+
     merged = s2.merge(
         mis_std, left_on="Refer_No_UTR", right_on="Cheque/ NEFT/ UTR No.", how="inner", suffixes=("", "_mis")
     )
@@ -650,7 +690,11 @@ def step4_strict_matches(step3_df: pd.DataFrame, outstanding_path: Path, dedupli
     L["_CLAIM_KEY"] = L.get("Claim No_out", "").apply(_clean_claim)
     R["_CLAIM_KEY"] = R["Claim No"].apply(_clean_claim)
     
-    matched_merged = L[L["_CLAIM_KEY"] != ""].merge(R[R["_CLAIM_KEY"] != ""], on="_CLAIM_KEY", how="inner", suffixes=("_out", "_m3"))
+    # Enforce 1-to-1
+    L_in = L[L["_CLAIM_KEY"] != ""].drop_duplicates(subset=["_CLAIM_KEY"])
+    R_in = R[R["_CLAIM_KEY"] != ""].drop_duplicates(subset=["_CLAIM_KEY"])
+
+    matched_merged = L_in.merge(R_in, on="_CLAIM_KEY", how="inner", suffixes=("_out", "_m3"))
     matched = matched_merged.drop(columns=["_CLAIM_KEY"])
     if deduplicate: matched = matched.drop_duplicates()
     
@@ -972,8 +1016,16 @@ def step2_match_bank_mis_by_utr_v2(bank_df: pd.DataFrame, mis_df: pd.DataFrame, 
             
     if not parts: return pd.DataFrame(), bank_df
     
-    merged = pd.concat(parts, ignore_index=True).merge(
-        mis_std, left_on="Matched_Key", right_on="Cheque/ NEFT/ UTR No.", how="inner", suffixes=("_bank", "_mis")
+    # Enforce 1-to-1 Bank but N-to-1 MIS
+    bank_matched = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["Matched_Key"])
+    
+    # Allow multiple claims per UTR in MIS
+    mis_subset = ["Cheque/ NEFT/ UTR No."]
+    if "Claim No" in mis_std.columns: mis_subset.append("Claim No")
+    mis_dedup = mis_std.drop_duplicates(subset=mis_subset)
+
+    merged = bank_matched.merge(
+        mis_dedup, left_on="Matched_Key", right_on="Cheque/ NEFT/ UTR No.", how="inner", suffixes=("_bank", "_mis")
     )
     if deduplicate: merged = merged.drop_duplicates()
     
@@ -1056,6 +1108,10 @@ def step4_strict_matches_v2(step3_df: pd.DataFrame, outstanding_path: Optional[P
     
     L = L[L["_CLAIM_KEY"] != ""]
     R = R[R["_CLAIM_KEY"] != ""]
+    
+    # Enforce 1-to-1
+    L = L.drop_duplicates(subset=["_CLAIM_KEY"])
+    R = R.drop_duplicates(subset=["_CLAIM_KEY"])
     
     matched_merged = L.merge(R, on="_CLAIM_KEY", how="inner", suffixes=("_out", "_m3"))
     matched = matched_merged.drop(columns=["_CLAIM_KEY"])
@@ -1762,6 +1818,7 @@ async def reconcile_v2_bulk(
         save_xlsx(out_clean_df, CURRENT_RUN_DIR / "00_outstanding_cleaned.xlsx")
         
         summary_rows = []
+        consolidated_frames = [] # List to hold all final match DFs
         files_resp = {}  # Map of "filename" -> "download_url"
 
         # Helper to register file
@@ -1818,6 +1875,17 @@ async def reconcile_v2_bulk(
                         # Step 4 Match (Strict)
                         final_match, final_unmatched = step4_strict_matches_v2(step2_match, outstanding_df=out_clean_df)
                         
+                        # Logic to add to consolidated list
+                        try:
+                            final_match_copy = final_match.copy()
+                            # Insert at position 0
+                            final_match_copy.insert(0, "Pipeline_Source", f"{bank_file.filename} vs {m_filename}")
+                            final_match_copy.insert(1, "Detected Bank", b_type)
+                            final_match_copy.insert(2, "Detected TPA", tpa)
+                            consolidated_frames.append(final_match_copy)
+                        except Exception as ce:
+                            print(f"[Consolidation] Error adding frame: {ce}")
+
                         # Save Outputs
                         p_bank = save_xlsx(bank_clean, pair_dir / "01_bank_clean.xlsx")
                         p_mis = save_xlsx(mis_clean_df, pair_dir / "02_mis_clean.xlsx")
@@ -1864,6 +1932,19 @@ async def reconcile_v2_bulk(
                     "Status": "Failed",
                     "produced_files": {}
                 })
+
+        # BUILD THE CONSOLIDATED MASTER SHEET
+        try:
+            if consolidated_frames:
+                master_df = pd.concat(consolidated_frames, ignore_index=True)
+                # Save it
+                master_path = CURRENT_RUN_DIR / "Consolidated_Matches.xlsx"
+                save_xlsx(master_df, master_path)
+                _reg_file(master_path)
+            else:
+                print("[Consolidation] No frames to concatenate.")
+        except Exception as me:
+            print(f"[Consolidation] Failed to create master sheet: {me}")
 
         # Save Summary
         pd.DataFrame(summary_rows).to_excel(CURRENT_RUN_DIR / "bulk_summary.xlsx", index=False)
