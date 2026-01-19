@@ -28,7 +28,7 @@ if not SECRET_KEY:
     SECRET_KEY = "insecure-default-key-change-this-in-production"
 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7*10  # 70 days
 
 # Password hashing with bcrypt - simplified configuration
 pwd_context = CryptContext(

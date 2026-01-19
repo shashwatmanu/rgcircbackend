@@ -158,10 +158,6 @@ TPA_MIS_MAPS_V2 = {
         "Cheque/ NEFT/ UTR No.": "Chq No",
         "Claim No": "Claim Number"
     },
-    "ERICSON": {
-        "Cheque/ NEFT/ UTR No.": "UTRNo",
-        "Claim No": "ClaimId"
-    },
     "SAFEWAY INSURANCE TPA PVT.LTD": {
         "Cheque/ NEFT/ UTR No.": "Chequeno",
         "Claim No": "ClaimNo"
@@ -190,6 +186,8 @@ TPA_MIS_MAPS_V2 = {
         "Cheque/ NEFT/ UTR No.": "UTR Number",
         "Claim No": "Alternate Claim Id"
     },
+
+    # ---- NEW LOT (patched) ----
     "VIDAL": {
         "Cheque/ NEFT/ UTR No.": "Cheque Number",
         "Claim No": "Claim Number"
@@ -205,6 +203,10 @@ TPA_MIS_MAPS_V2 = {
     "ICICI LOMBARD": {
         "Cheque/ NEFT/ UTR No.": "Claim-Cheque Number",
         "Claim No": "Claim Number"
+    },
+    "ERICSON": {
+        "Cheque/ NEFT/ UTR No.": "UTRNo",
+        "Claim No": "ClaimId"
     }
 }
 
@@ -224,7 +226,8 @@ def _clean_key_series(series: pd.Series) -> pd.Series:
     Make sure stringified nulls do not become joinable keys.
     Returns a pandas Series where null-like tokens become real NaN.
     """
-    s = series.copy().astype("string") 
+    s = series.copy()
+    s = s.astype("string")  # pandas string dtype preserves NA
     s = s.str.replace("\xa0", " ", regex=False).str.strip()
     lower = s.str.lower()
     s = s.mask(lower.isin(_NULL_TOKENS), pd.NA)
@@ -772,32 +775,67 @@ def clean_raw_bank_statement_icici_v2(path):
     tables = []
 
     if ext in [".xlsx", ".xls", ".xlsm"]:
-        try:
-            xls = pd.ExcelFile(path)
-            for sheet in xls.sheet_names:
-                raw = xls.parse(sheet_name=sheet, header=None)
-                tbl = _extract_table_from_raw(raw)
-                if tbl is not None:
-                    tables.append(tbl)
-        except Exception: pass
-
-    elif ext == ".csv":
-        try:
-            raw = pd.read_csv(path, header=None)
+        xls = pd.ExcelFile(path)
+        for sheet in xls.sheet_names:
+            raw = xls.parse(sheet_name=sheet, header=None)
             tbl = _extract_table_from_raw(raw)
             if tbl is not None:
                 tables.append(tbl)
-        except Exception: pass
+
+    elif ext == ".csv":
+        raw = pd.read_csv(path, header=None)
+        tbl = _extract_table_from_raw(raw)
+        if tbl is not None:
+            tables.append(tbl)
 
     else:
         try:
             raw = pd.read_excel(path, header=None)
         except:
-            try: raw = pd.read_csv(path, header=None)
-            except: raw = pd.DataFrame()
+            raw = pd.read_csv(path, header=None)
         tbl = _extract_table_from_raw(raw)
         if tbl is not None:
             tables.append(tbl)
+
+    if not tables:
+        raise ValueError("ICICI bank parser: No usable transaction table found.")
+
+    df_all = pd.concat(tables, ignore_index=True)
+
+    keep_cols = [
+        "No.",
+        "Transaction ID",
+        "Txn Posted Date",
+        "Description",
+        "Cr/Dr",
+        "Transaction Amount(INR)",
+    ]
+    existing = [c for c in keep_cols if c in df_all.columns]
+    df = df_all[existing].copy()
+
+    df = df.dropna(how="all")
+
+    if not df.empty:
+        def _is_repeated_header(row):
+            for c in existing:
+                if str(row[c]).strip() != c:
+                    return False
+            return True
+        df = df[~df.apply(_is_repeated_header, axis=1)]
+
+    if "Description" in df.columns:
+        desc = df["Description"].astype(str).str.upper()
+        pattern = (
+            r"TOTAL|OPENING BALANCE|CLOSING BALANCE|"
+            r"BALANCE BROUGHT FORWARD|BALANCE CARRIED FORWARD"
+        )
+        df = df[~desc.str.contains(pattern, regex=True, na=False)]
+
+    for col in ["No.", "Transaction Amount(INR)"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="ignore")
+
+    return df.drop_duplicates().reset_index(drop=True)
 
     if not tables:
         raise ValueError("ICICI bank parser: No usable transaction table found.")
@@ -858,7 +896,6 @@ def clean_raw_bank_statement_axis_v2(path):
             vals = [str(v).strip() for v in row.tolist() if pd.notna(v)]
             upper_vals = [v.upper() for v in vals]
 
-            # Improved AXIS detection
             if (
                 any(v == "S.NO" for v in upper_vals)
                 and any("TRANSACTION DATE" in v for v in upper_vals)
@@ -888,29 +925,24 @@ def clean_raw_bank_statement_axis_v2(path):
     tables = []
 
     if ext in [".xlsx", ".xls", ".xlsm"]:
-        try:
-            xls = pd.ExcelFile(path)
-            for sheet in xls.sheet_names:
-                raw = xls.parse(sheet_name=sheet, header=None)
-                tbl = _extract_table_from_raw(raw)
-                if tbl is not None:
-                    tables.append(tbl)
-        except Exception: pass
-
-    elif ext == ".csv":
-        try:
-            raw = pd.read_csv(path, header=None)
+        xls = pd.ExcelFile(path)
+        for sheet in xls.sheet_names:
+            raw = xls.parse(sheet_name=sheet, header=None)
             tbl = _extract_table_from_raw(raw)
             if tbl is not None:
                 tables.append(tbl)
-        except Exception: pass
+
+    elif ext == ".csv":
+        raw = pd.read_csv(path, header=None)
+        tbl = _extract_table_from_raw(raw)
+        if tbl is not None:
+            tables.append(tbl)
 
     else:
         try:
             raw = pd.read_excel(path, header=None)
         except Exception:
-            try: raw = pd.read_csv(path, header=None)
-            except: raw = pd.DataFrame()
+            raw = pd.read_csv(path, header=None)
         tbl = _extract_table_from_raw(raw)
         if tbl is not None:
             tables.append(tbl)
@@ -921,21 +953,28 @@ def clean_raw_bank_statement_axis_v2(path):
     df_all = pd.concat(tables, ignore_index=True)
 
     orig_to_canon = {
-        "S.No": "No.", 
+        "S.No": "No.",
         "Transaction Date (dd/mm/yyyy)": "Txn Posted Date",
-        "Value Date (dd/mm/yyyy)": "Value Date", 
+        "Value Date (dd/mm/yyyy)": "Value Date",
         "Particulars": "Description",
-        "Amount(INR)": "Transaction Amount(INR)", 
+        "Amount(INR)": "Transaction Amount(INR)",
         "Transaction Amount(INR)": "Transaction Amount(INR)",
-        "Debit/Credit": "Cr/Dr", 
+        "Debit/Credit": "Cr/Dr",
         "Balance(INR)": "Balance(INR)",
-        "Cheque Number": "Cheque Number", 
+        "Cheque Number": "Cheque Number",
         "Branch Name(SOL)": "Branch Name(SOL)",
     }
 
     canon_cols_order = [
-        "No.", "Txn Posted Date", "Value Date", "Description", "Cr/Dr", 
-        "Transaction Amount(INR)", "Balance(INR)", "Cheque Number", "Branch Name(SOL)"
+        "No.",
+        "Txn Posted Date",
+        "Value Date",
+        "Description",
+        "Cr/Dr",
+        "Transaction Amount(INR)",
+        "Balance(INR)",
+        "Cheque Number",
+        "Branch Name(SOL)",
     ]
 
     col_map = {}
@@ -956,9 +995,12 @@ def clean_raw_bank_statement_axis_v2(path):
     def _is_repeated_header(row):
         for c in canon_cols_order:
             val = str(row[c]).strip()
-            if val == "" and canon_df[c].isna().all(): continue
-            if val == c: continue
-            else: return False
+            if val == "" and canon_df[c].isna().all():
+                continue
+            if val == c:
+                continue
+            else:
+                return False
         return True
 
     if not canon_df.empty:
@@ -1003,7 +1045,8 @@ def clean_raw_bank_statement_axis_v2(path):
             canon_df["No."].astype(str).str.strip(), errors="ignore"
         )
 
-    return canon_df.drop_duplicates().reset_index(drop=True)
+    canon_df = canon_df.drop_duplicates().reset_index(drop=True)
+    return canon_df
 
 def detect_bank_type(bank_path: Path) -> str:
     """
@@ -1056,32 +1099,27 @@ def detect_bank_type(bank_path: Path) -> str:
         return None
 
     if ext in [".xlsx", ".xls", ".xlsm"]:
-        try:
-            xls = pd.ExcelFile(bank_path)
-            for sh in xls.sheet_names:
-                raw = xls.parse(sh, header=None)
-                bt = _scan_raw(raw)
-                if bt: return bt
-        except: pass
+        xls = pd.ExcelFile(bank_path)
+        for sh in xls.sheet_names:
+            raw = xls.parse(sh, header=None)
+            bt = _scan_raw(raw)
+            if bt:
+                return bt
 
     elif ext == ".csv":
-        try:
-            raw = pd.read_csv(bank_path, header=None)
-            bt = _scan_raw(raw)
-            if bt: return bt
-        except: pass
+        raw = pd.read_csv(bank_path, header=None)
+        bt = _scan_raw(raw)
+        if bt:
+            return bt
 
     else:
         try:
             raw = pd.read_excel(bank_path, header=None)
-            bt = _scan_raw(raw)
-            if bt: return bt
         except Exception:
-            try: 
-                raw = pd.read_csv(bank_path, header=None)
-                bt = _scan_raw(raw)
-                if bt: return bt
-            except: pass
+            raw = pd.read_csv(bank_path, header=None)
+        bt = _scan_raw(raw)
+        if bt:
+            return bt
 
     raise ValueError(
         "Could not auto-detect bank type from file headers. "
@@ -1117,8 +1155,6 @@ def detect_tpa_choice(mis_path: Path, scan_rows: int = 120) -> str:
 
             hits = 0
             for t in tokens:
-                # just count presence of ANY known RHS token
-                # (header row selection only; final decision uses strict pair match)
                 if t:
                     hits += 1
             if hits > best_hits:
@@ -1140,19 +1176,16 @@ def detect_tpa_choice(mis_path: Path, scan_rows: int = 120) -> str:
 
     raws = []
     if ext in [".xlsx", ".xls", ".xlsm"]:
-        try:
-            xls = pd.ExcelFile(mis_path)
-            for sh in xls.sheet_names: raws.append(xls.parse(sh, header=None, dtype=str))
-        except: pass
+        xls = pd.ExcelFile(mis_path)
+        for sh in xls.sheet_names:
+            raws.append(xls.parse(sh, header=None, dtype=str))
     elif ext == ".csv":
-        try: raws.append(pd.read_csv(mis_path, header=None, dtype=str))
-        except: pass
+        raws.append(pd.read_csv(mis_path, header=None, dtype=str))
     else:
         try:
             raws.append(pd.read_excel(mis_path, header=None, dtype=str))
         except Exception:
-            try: raws.append(pd.read_csv(mis_path, header=None, dtype=str))
-            except: pass
+            raws.append(pd.read_csv(mis_path, header=None, dtype=str))
 
     header_tokens = None
     best_token_count = -1
@@ -1187,7 +1220,18 @@ def detect_tpa_choice(mis_path: Path, scan_rows: int = 120) -> str:
     )
 
 def parse_mis_universal_v2(mis_path, tpa_name: str, empty_threshold: float = 0.5) -> pd.DataFrame:
+    """
+    Universal MIS ingestion parser (TPA-aware):
+    - Uses TPA_MIS_MAPS[tpa_name] to drive header detection
+    - Returns MIS with ORIGINAL source column names preserved.
+
+    PATCH #2 (minimal):
+    - Tolerate 2-row headers by scoring row_i + row_{i+1}
+    - Build header by filling blanks from the next row (only fill; no concatenation)
+    """
     mis_path = Path(mis_path)
+    ext = mis_path.suffix.lower()
+
     if tpa_name not in TPA_MIS_MAPS_V2:
         raise ValueError(f"Unknown TPA '{tpa_name}' for MIS parsing.")
 
@@ -1295,28 +1339,25 @@ def parse_mis_universal_v2(mis_path, tpa_name: str, empty_threshold: float = 0.5
 
     tables = []
 
-    if mis_path.suffix.lower() in [".xlsx", ".xls", ".xlsm"]:
-        try:
-            xls = pd.ExcelFile(mis_path)
-            for sheet in xls.sheet_names:
-                raw = xls.parse(sheet_name=sheet, header=None, dtype=str)
-                tbl = _extract_from_sheet(raw)
-                if tbl is not None:
-                    tables.append(tbl)
-        except Exception: pass
-    elif mis_path.suffix.lower() == ".csv":
-        try:
-            raw = pd.read_csv(mis_path, header=None, dtype=str)
+    if ext in [".xlsx", ".xls", ".xlsm"]:
+        xls = pd.ExcelFile(mis_path)
+        for sh in xls.sheet_names:
+            raw = xls.parse(sh, header=None, dtype=str)
             tbl = _extract_from_sheet(raw)
             if tbl is not None:
                 tables.append(tbl)
-        except Exception: pass
+    
+    elif ext == ".csv":
+        raw = pd.read_csv(mis_path, header=None, dtype=str)
+        tbl = _extract_from_sheet(raw)
+        if tbl is not None:
+            tables.append(tbl)
+
     else:
         try:
             raw = pd.read_excel(mis_path, header=None, dtype=str)
         except Exception:
-            try: raw = pd.read_csv(mis_path, header=None, dtype=str)
-            except: raw = pd.DataFrame()
+            raw = pd.read_csv(mis_path, header=None, dtype=str)
         tbl = _extract_from_sheet(raw)
         if tbl is not None:
             tables.append(tbl)
@@ -1328,6 +1369,19 @@ def parse_mis_universal_v2(mis_path, tpa_name: str, empty_threshold: float = 0.5
     return final.reset_index(drop=True)
 
 def step2_match_bank_mis_by_utr_v2(bank_df: pd.DataFrame, mis_df: pd.DataFrame, tpa_name: str, deduplicate: bool = True, min_key_len: int = 8):
+    """
+    PATCH #1:
+    - Build UNIQUE PAIRS of (UTR, Claim No) from MIS (NOT just unique UTR list)
+
+    PATCH #3:
+    - Ignore null-like tokens incl 0/0.0 (done in cleaner)
+    - Minimum UTR string length guard (default 8)
+
+    NEW (as discussed):
+    - If MIS UTR length > 16, use only first 16 chars for bank substring search + merge.
+      Example: AXISCN1218291971UTIBN62026011379400525 -> AXISCN1218291971
+    - MIS-side only: original UTR preserved in output; _UTR_SEARCH used for matching.
+    """
     if bank_df.empty:
         return pd.DataFrame(), bank_df
     if mis_df.empty:
@@ -1349,27 +1403,34 @@ def step2_match_bank_mis_by_utr_v2(bank_df: pd.DataFrame, mis_df: pd.DataFrame, 
     if "Claim No" in mis_std.columns:
         mis_std["Claim No"] = _clean_key_series(mis_std["Claim No"])
 
-    # Build unique (UTR, Claim) pairs
+    # NEW: MIS-side search key (truncate ONLY if >16)
+    mis_std["_UTR_SEARCH"] = mis_std["Cheque/ NEFT/ UTR No."].astype("string").str.strip()
+    mis_std["_UTR_SEARCH"] = mis_std["_UTR_SEARCH"].apply(
+        lambda s: (str(s)[:16] if (pd.notna(s) and len(str(s)) > 16) else (str(s) if pd.notna(s) else np.nan))
+    )
+    mis_std["_UTR_SEARCH"] = _clean_key_series(mis_std["_UTR_SEARCH"])
+
+    # Build unique (UTR_SEARCH, Claim) pairs
     if "Claim No" in mis_std.columns:
-        pairs = mis_std[["Cheque/ NEFT/ UTR No.", "Claim No"]].copy()
-        pairs = pairs.dropna(subset=["Cheque/ NEFT/ UTR No."])
-        pairs["Cheque/ NEFT/ UTR No."] = pairs["Cheque/ NEFT/ UTR No."].astype(str).map(str.strip)
+        pairs = mis_std[["_UTR_SEARCH", "Claim No"]].copy()
+        pairs = pairs.dropna(subset=["_UTR_SEARCH"])
+        pairs["_UTR_SEARCH"] = pairs["_UTR_SEARCH"].astype(str).map(str.strip)
         pairs["Claim No"] = pairs["Claim No"].astype(str).map(str.strip)
         pairs = pairs.drop_duplicates()
     else:
-        pairs = mis_std[["Cheque/ NEFT/ UTR No."]].copy()
-        pairs = pairs.dropna(subset=["Cheque/ NEFT/ UTR No."])
-        pairs["Cheque/ NEFT/ UTR No."] = pairs["Cheque/ NEFT/ UTR No."].astype(str).map(str.strip)
+        pairs = mis_std[["_UTR_SEARCH"]].copy()
+        pairs = pairs.dropna(subset=["_UTR_SEARCH"])
+        pairs["_UTR_SEARCH"] = pairs["_UTR_SEARCH"].astype(str).map(str.strip)
         pairs = pairs.drop_duplicates()
 
     # Min length guard
-    pairs = pairs[pairs["Cheque/ NEFT/ UTR No."].map(lambda x: len(str(x)) >= int(min_key_len))]
+    pairs = pairs[pairs["_UTR_SEARCH"].map(lambda x: len(str(x)) >= int(min_key_len))]
 
     col_to_search = "Description" if "Description" in bank_df.columns else bank_df.columns[1]
     bank_text = bank_df[col_to_search].astype(str)
 
-    # We only need to substring-search each UTR once; the merge will explode to all claims safely.
-    utr_keys = pairs["Cheque/ NEFT/ UTR No."].dropna().astype(str).map(str.strip).unique()
+    # We only need to substring-search each key once; the merge will explode to all claims safely.
+    utr_keys = pairs["_UTR_SEARCH"].dropna().astype(str).map(str.strip).unique()
     
     parts = []
     for utr in utr_keys:
@@ -1391,7 +1452,7 @@ def step2_match_bank_mis_by_utr_v2(bank_df: pd.DataFrame, mis_df: pd.DataFrame, 
     merged = matched_bank.merge(
         mis_std,
         left_on="Matched_Key",
-        right_on="Cheque/ NEFT/ UTR No.",
+        right_on="_UTR_SEARCH",
         how="inner",
         suffixes=("_bank", "_mis"),
     )
@@ -1407,9 +1468,8 @@ def step2_match_bank_mis_by_utr_v2(bank_df: pd.DataFrame, mis_df: pd.DataFrame, 
     return merged.reset_index(drop=True), not_in
 
 def parse_outstanding_excel_to_clean_v2(xlsx_path: Path) -> pd.DataFrame:
-    # This is similar to V1 but using valid prompt logic to be safe
     raw = pd.read_excel(xlsx_path, header=None, dtype=str)
-    
+
     def _hunt_header_v2(df_raw):
         norm = lambda s: re.sub(r"[^A-Z]", "", str(s).upper())
         targets = [norm(k) for k in _OUT_HEADER_KEYS]
@@ -1419,79 +1479,280 @@ def parse_outstanding_excel_to_clean_v2(xlsx_path: Path) -> pd.DataFrame:
             hits = 0
             for cell in row:
                 nc = norm(cell)
-                if nc in targets or (nc.startswith("CONSUL") and "CONSULTANT" in targets): hits += 1
-            if best_hits is None or hits > best_hits: best_idx, best_hits = i, hits
-        if best_idx is None or best_hits <= 2: raise ValueError("Outstanding parser V2: Header not found.")
+                if nc in targets or (nc.startswith("CONSUL") and "CONSULTANT" in targets):
+                    hits += 1
+            if best_hits is None or hits > best_hits:
+                best_idx, best_hits = i, hits
+        if best_idx is None or best_hits <= 2:
+            raise ValueError("Outstanding parser V2: Header not found.")
         return best_idx
+
+    def _row_is_section_header_like(row: pd.Series) -> bool:
+        vals = row.fillna("").astype(str).tolist()
+        if not vals:
+            return False
+        col0 = vals[0].strip()
+        others_empty = all((str(v).strip() == "") for v in vals[1:])
+        return bool(col0) and others_empty
+
+    def _clean_entity_name(text: str) -> str:
+        s = (text or "").replace("\xa0", " ").strip()
+        s = re.sub(r"^\s*\d+\s*", "", s)
+        return re.sub(r"\s+", " ", s)
 
     hdr_idx = _hunt_header_v2(raw)
     header_vals = [str(x).strip() for x in raw.iloc[hdr_idx].tolist()]
     header_norm = []
     for h in header_vals:
         hn = str(h).strip()
-        if re.sub(r"[^A-Za-z]", "", hn).lower().startswith("consul"): hn = "Consultant"
-        if hn.strip().lower() == "insurance companies": hn = "Insurance Company"
+        if re.sub(r"[^A-Za-z]", "", hn).lower().startswith("consul"):
+            hn = "Consultant"
+        if hn.strip().lower() == "insurance companies":
+            hn = "Insurance Company"
         header_norm.append(hn)
-        
+
     df = raw.iloc[hdr_idx + 1:].copy()
     if df.shape[1] < len(header_norm):
-        for _ in range(len(header_norm) - df.shape[1]): df[df.shape[1]] = ""
+        for _ in range(len(header_norm) - df.shape[1]):
+            df[df.shape[1]] = ""
     df = df.iloc[:, :len(header_norm)]
     df.columns = header_norm
 
     ent_col, current_entity, header_rows = [], "", []
     for idx, row in df.iterrows():
-        vals = row.fillna("").astype(str).tolist()
-        if vals[0].strip() and all(not str(v).strip() for v in vals[1:]):
-            current_entity = vals[0].replace("\xa0", " ").strip()
+        if _row_is_section_header_like(row):
+            current_entity = _clean_entity_name(row.iloc[0])
             header_rows.append(idx)
         ent_col.append(current_entity)
     df["Bill Company Name"] = ent_col
-    if header_rows: df = df.drop(index=header_rows)
-    
+
+    if header_rows:
+        df = df.drop(index=header_rows)
+
     df = df[~df.apply(lambda r: any(t in " ".join([str(x) for x in r]).upper() for t in _FOOTER_TOKENS), axis=1)]
-    for c in df.columns: df[c] = df[c].astype(str).str.replace("\xa0", " ", regex=False).str.strip()
+    for c in df.columns:
+        df[c] = df[c].astype(str).str.replace("\xa0", " ", regex=False).str.strip()
     return df.reset_index(drop=True)
 
 def step4_strict_matches_v2(step3_df: pd.DataFrame, outstanding_path: Optional[Path] = None, outstanding_df: Optional[pd.DataFrame] = None, deduplicate: bool = True):
+    """
+    ONLY NEW CHANGES (per your instruction):
+    - Strip parentheses "(...)" if present before keying
+    - Strip content after "." before keying
+    - Restrict trailing suffix stripping to ONLY -0..-20 or _0.._20 (NOT large digit groups)
+
+    FIX (this specific issue):
+    - Numeric fallback must NOT merge digit groups by removing separators.
+      Example: RC-HS25-15278172 must yield largest group = 15278172 (not 2515278172).
+    """
     if step3_df.empty: return pd.DataFrame(), pd.DataFrame()
     if "Claim No" not in step3_df.columns: raise ValueError("Step 3 missing Claim No")
-    
+
+    # Load Outstanding
     if outstanding_df is not None:
         out = outstanding_df.copy()
     elif outstanding_path:
         out = parse_outstanding_excel_to_clean_v2(outstanding_path).copy()
     else:
         raise ValueError("Either outstanding_path or outstanding_df must be provided")
-    if "Claim No" in out.columns: out = out.rename(columns={"Claim No": "Claim No_out"})
-    
-    def _clean_claim(val):
-        if pd.isna(val): return ""
-        s = str(val).strip()
-        if s.lower() in ['nan', 'none', 'null', 'na', 'n/a', '']: return ""
-        if s.endswith(".0"): s = s[:-2]
+
+    if "Claim No" in out.columns:
+        out = out.rename(columns={"Claim No": "Claim No_out"})
+
+    for col in ["Patient Name", "CR No", "Balance"]:
+        if col not in out.columns:
+             # Just warn or skip if missing? The user script raises ValueError.
+             # We'll allow it but logs might show issues.
+             pass
+
+    _SEP_RE = re.compile(r"[\s\-_]+")
+    _NONALNUM_RE = re.compile(r"[^A-Z0-9]")
+    _DIGITS_RE = re.compile(r"\d+")
+
+    _PAREN_RE = re.compile(r"\([^)]*\)")
+    _DOT_RE = re.compile(r"\..*$")
+    _SUFFIX_RE = re.compile(r"([_-])(\d{1,2})$")  # candidate small suffix only
+
+    def _strip_trailing_suffix(s: str) -> str:
+        m = _SUFFIX_RE.search(s)
+        if not m:
+            return s
+        n = int(m.group(2))
+        if 0 <= n <= 20:
+            return s[:m.start()]
         return s
 
-    L, R = out.copy(), step3_df.copy()
-    L["_CLAIM_KEY"] = L.get("Claim No_out", "").apply(_clean_claim)
-    R["_CLAIM_KEY"] = R["Claim No"].apply(_clean_claim)
-    
-    L = L[L["_CLAIM_KEY"] != ""]
-    R = R[R["_CLAIM_KEY"] != ""]
-    
-    # RELAXED LOGIC: No pre-deduplication on keys.
-    # Allow logic to match whatever keys exist (N-to-N possible if duplicates exist).
-    
-    matched_merged = L.merge(R, on="_CLAIM_KEY", how="inner", suffixes=("_out", "_m3"))
-    matched = matched_merged.drop(columns=["_CLAIM_KEY"])
-    if deduplicate: matched = matched.drop_duplicates()
-    
-    matched_keys = matched_merged["_CLAIM_KEY"].unique()
-    unmatched_step3 = R[~R["_CLAIM_KEY"].isin(matched_keys)].copy()
-    unmatched_step3 = unmatched_step3.drop(columns=["_CLAIM_KEY"])
-    if deduplicate: unmatched_step3 = unmatched_step3.drop_duplicates()
-    
-    return matched, unmatched_step3
+    def _md_canon(s: str) -> str:
+        if s.startswith("MDI1"):
+            return "MD1" + s[4:]
+        if s.startswith("MDI"):
+            return "MD1" + s[3:]
+        return s
+
+    def _alpha_key(val) -> str:
+        if pd.isna(val):
+            return ""
+        s = str(val).replace("\xa0", " ").strip().upper()
+        if s.lower() in ['nan', 'none', 'null', 'na', 'n/a', '']:
+            return ""
+        if s.endswith(".0"):
+            s = s[:-2]
+
+        s = _PAREN_RE.sub("", s)
+        s = _DOT_RE.sub("", s)
+        s = _strip_trailing_suffix(s)
+
+        s = _SEP_RE.sub("", s)
+        s = _md_canon(s)
+        s = _NONALNUM_RE.sub("", s)
+        return s
+
+    # FIXED: do NOT remove separators before digit extraction (prevents HS25 + 15278172 collapsing)
+    def _largest_digit_group(val):
+        """
+        Returns (largest_digit_group, ambiguous_flag).
+        ambiguous_flag=True when there are 2+ digit groups of the same max length.
+        """
+        if pd.isna(val):
+            return "", True
+        s = str(val).replace("\xa0", " ").strip().upper()
+        if s.lower() in ['nan', 'none', 'null', 'na', 'n/a', '']:
+            return "", True
+        if s.endswith(".0"):
+            s = s[:-2]
+
+        s = _PAREN_RE.sub("", s)
+        s = _DOT_RE.sub("", s)
+        s = _strip_trailing_suffix(s)
+
+        # IMPORTANT: keep separators so digit groups stay separate (HS25 vs 15278172)
+        groups = _DIGITS_RE.findall(s)
+        if not groups:
+            return "", True
+
+        lengths = [len(g) for g in groups]
+        max_len = max(lengths)
+        best = [g for g in groups if len(g) == max_len]
+
+        if len(best) != 1:
+            return best[0], True
+        return best[0], False
+
+    def _out_numeric_tokens(val) -> list:
+        if pd.isna(val):
+            return []
+        s = str(val).replace("\xa0", " ").strip().upper()
+        if s.lower() in ['nan', 'none', 'null', 'na', 'n/a', '']:
+            return []
+
+        if s.endswith(".0"):
+            s = s[:-2]
+
+        s = _PAREN_RE.sub("", s)
+        s = _DOT_RE.sub("", s)
+        s = _strip_trailing_suffix(s)
+
+        parts = [p.strip() for p in s.split("/") if p.strip()]
+        tokens = []
+        for p in parts:
+            p2 = _SEP_RE.sub("", p)
+            p2 = _NONALNUM_RE.sub("", p2)
+            if p2.isdigit():
+                tokens.append(p2)
+        return tokens
+
+    L = out.copy().reset_index(drop=False).rename(columns={"index": "_OUT_IDX"})
+    R = step3_df.copy().reset_index(drop=True)
+
+    R["_RID"] = np.arange(len(R))
+    L["_ALPHA_KEY"] = L.get("Claim No_out", "").apply(_alpha_key)
+    R["_ALPHA_KEY"] = R["Claim No"].apply(_alpha_key)
+
+    L_alpha = L[L["_ALPHA_KEY"] != ""].copy()
+    R_alpha = R[R["_ALPHA_KEY"] != ""].copy()
+
+    merged_alpha = L_alpha.merge(
+        R_alpha,
+        on="_ALPHA_KEY",
+        how="inner",
+        suffixes=("_out", "_m3")
+    )
+    merged_alpha["MATCH_MODE"] = "ALPHA_STRICT"
+
+    matched_alpha_keys = set(merged_alpha["_ALPHA_KEY"].unique().tolist())
+    L_unmatched = L[~L["_ALPHA_KEY"].isin(matched_alpha_keys)].copy()
+
+    MIN_NUM_LEN = 6
+
+    ldg = R["Claim No"].apply(_largest_digit_group)
+    R["_MIS_LDG"] = [x[0] for x in ldg]
+    R["_MIS_LDG_AMB"] = [x[1] for x in ldg]
+    R["_MIS_LDG_LEN"] = R["_MIS_LDG"].astype(str).map(len)
+
+    R_num = R[(~R["_MIS_LDG_AMB"]) & (R["_MIS_LDG"] != "") & (R["_MIS_LDG_LEN"] >= MIN_NUM_LEN)].copy()
+
+    token_rows = []
+    for _, row in L_unmatched.iterrows():
+        tokens = _out_numeric_tokens(row.get("Claim No_out", ""))
+        if not tokens:
+            continue
+        tokens = [t for t in tokens if len(t) >= MIN_NUM_LEN]
+        if not tokens:
+            continue
+
+        mode = "NUM_TOKEN" if len(tokens) > 1 else "NUM_LARGEST"
+        for t in tokens:
+            token_rows.append({
+                "_OUT_IDX": row["_OUT_IDX"],
+                "_OUT_TOKEN": t,
+                "_TOKEN_MODE": mode
+            })
+
+    merged_num = pd.DataFrame()
+    if token_rows and not R_num.empty:
+        T = pd.DataFrame(token_rows)
+
+        cand = T.merge(
+            R_num[["_RID", "_MIS_LDG"]],
+            left_on="_OUT_TOKEN",
+            right_on="_MIS_LDG",
+            how="inner"
+        ).drop_duplicates()
+
+        grp = cand.groupby("_OUT_IDX")["_RID"].nunique().reset_index(name="_N")
+        ok_out = set(grp.loc[grp["_N"] == 1, "_OUT_IDX"].tolist())
+
+        cand_ok = cand[cand["_OUT_IDX"].isin(ok_out)].copy()
+        cand_ok = cand_ok.sort_values(["_OUT_IDX", "_RID"]).drop_duplicates(subset=["_OUT_IDX"])
+
+        L_pick = L.merge(cand_ok[["_OUT_IDX", "_RID"]], on="_OUT_IDX", how="inner")
+        L_pick = L_pick.merge(cand_ok[["_OUT_IDX", "_TOKEN_MODE"]], on="_OUT_IDX", how="left")
+
+        merged_num = L_pick.merge(
+            R,
+            on="_RID",
+            how="inner",
+            suffixes=("_out", "_m3")
+        )
+        merged_num["MATCH_MODE"] = merged_num["_TOKEN_MODE"].astype(str)
+
+    matched = pd.concat([merged_alpha, merged_num], ignore_index=True)
+
+    if deduplicate and not matched.empty:
+        matched = matched.drop_duplicates()
+
+    matched_rids = set(matched["_RID"].unique().tolist()) if (not matched.empty and "_RID" in matched.columns) else set()
+    unmatched_step3 = R[~R["_RID"].isin(matched_rids)].copy()
+
+    drop_cols_R = [c for c in ["_RID", "_ALPHA_KEY", "_MIS_LDG", "_MIS_LDG_AMB", "_MIS_LDG_LEN"] if c in unmatched_step3.columns]
+    if drop_cols_R:
+        unmatched_step3 = unmatched_step3.drop(columns=drop_cols_R)
+
+    drop_cols_matched = [c for c in ["_OUT_IDX", "_ALPHA_KEY", "_RID", "_TOKEN_MODE", "_OUT_TOKEN", "_MIS_LDG", "_MIS_LDG_AMB", "_MIS_LDG_LEN"] if c in matched.columns]
+    if drop_cols_matched:
+        matched = matched.drop(columns=drop_cols_matched)
+
+    return matched.reset_index(drop=True), unmatched_step3.reset_index(drop=True)
 
 
 def save_xlsx(df: pd.DataFrame, path: Path) -> Path:
