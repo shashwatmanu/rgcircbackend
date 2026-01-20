@@ -1,5 +1,6 @@
 import io, os, shutil, zipfile, re, secrets
 from datetime import datetime, timedelta
+import pytz
 from pathlib import Path
 from typing import Optional, List, Dict
 
@@ -1775,9 +1776,11 @@ def zip_outputs(paths, zip_path: Path):
 def log_activity(username, bank_type, step, run_id, duration=None, counts=None, tpa=None, success=True, error=None):
     if activity_logs_collection is not None:
         try:
+            ist = pytz.timezone('Asia/Kolkata')
+            ts = datetime.now(ist).replace(tzinfo=None)
             activity_logs_collection.insert_one({
                 "username": username, "bank_type": bank_type, "step_completed": step, "run_id": run_id,
-                "timestamp": datetime.utcnow(), "duration_seconds": duration, "row_counts": counts or {},
+                "timestamp": ts, "duration_seconds": duration, "row_counts": counts or {},
                 "tpa_name": tpa, "success": success, "error_message": error
             })
         except: pass
@@ -1798,7 +1801,7 @@ async def register(user: UserRegister):
     
     user_dict = {
         "username": user.username, "email": user.email, "full_name": user.full_name,
-        "hashed_password": get_password_hash(user.password), "created_at": datetime.utcnow(),
+        "hashed_password": get_password_hash(user.password), "created_at": datetime.now(pytz.timezone('Asia/Kolkata')).replace(tzinfo=None),
         "is_active": True, "email_verified": False, "verification_token": None
     }
     try:
@@ -1847,7 +1850,7 @@ async def send_verification_email_endpoint(current_user: UserInDB = Depends(get_
     token = secrets.token_urlsafe(32)
     users_collection.update_one(
         {"username": current_user.username},
-        {"$set": {"verification_token": token, "verification_token_expires": datetime.utcnow() + timedelta(hours=24)}}
+        {"$set": {"verification_token": token, "verification_token_expires": datetime.now(pytz.timezone('Asia/Kolkata')).replace(tzinfo=None) + timedelta(hours=24)}}
     )
     
     verification_url = f"{os.getenv('FRONTEND_URL', 'https://recondb.vercel.app')}/auth/verify-email?token={token}"
@@ -1861,7 +1864,7 @@ async def verify_email_with_token(token: str = Form(...)):
     if not AUTH_ENABLED or users_collection is None: raise HTTPException(503, "Auth disabled")
     user = users_collection.find_one({"verification_token": token})
     if not user: raise HTTPException(400, "Invalid token")
-    if user.get("verification_token_expires") and datetime.utcnow() > user["verification_token_expires"]:
+    if user.get("verification_token_expires") and datetime.now(pytz.timezone('Asia/Kolkata')).replace(tzinfo=None) > user["verification_token_expires"]:
         raise HTTPException(400, "Token expired")
     
     users_collection.update_one(
@@ -1889,9 +1892,17 @@ async def get_user_stats(current_user: UserInDB = Depends(get_current_user)):
     activities = list(activity_logs_collection.find({"username": current_user.username, "success": True}, {"_id": 0}).sort("timestamp", -1))
     
     completed = [a for a in activities if a.get("step_completed") == 4]
-    now = datetime.utcnow()
-    this_week = len([a for a in completed if a["timestamp"] >= now - timedelta(days=7)])
-    this_month = len([a for a in completed if a["timestamp"] >= now - timedelta(days=30)])
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    
+    def to_ist(d):
+        if d.tzinfo is None:
+            # Assume UTC if naive (legacy data)
+            return pytz.utc.localize(d).astimezone(ist)
+        return d.astimezone(ist)
+
+    this_week = len([a for a in completed if to_ist(a["timestamp"]) >= now - timedelta(days=7)])
+    this_month = len([a for a in completed if to_ist(a["timestamp"]) >= now - timedelta(days=30)])
     
     streak = 0
     if completed:
@@ -1919,14 +1930,16 @@ async def get_user_activity(current_user: UserInDB = Depends(get_current_user), 
 @APP.get("/profile/daily", response_model=List[DailyActivityResponse])
 async def get_daily_activity(current_user: UserInDB = Depends(get_current_user), days: int = 30):
     if not AUTH_ENABLED or activity_logs_collection is None: raise HTTPException(503, "Unavailable")
-    start = datetime.utcnow() - timedelta(days=days)
+    ist = pytz.timezone('Asia/Kolkata')
+    start = datetime.now(ist) - timedelta(days=days)
     pipeline = [
         {"$match": {"username": current_user.username, "timestamp": {"$gte": start}, "step_completed": 4, "success": True}},
-        {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}}, "count": {"$sum": 1}}},
+        {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp", "timezone": "Asia/Kolkata"}}, "count": {"$sum": 1}}},
         {"$sort": {"_id": 1}}
     ]
     results = {r["_id"]: r["count"] for r in activity_logs_collection.aggregate(pipeline)}
-    return [DailyActivityResponse(date=(datetime.utcnow() - timedelta(days=days-i-1)).strftime("%Y-%m-%d"), count=results.get((datetime.utcnow() - timedelta(days=days-i-1)).strftime("%Y-%m-%d"), 0)) for i in range(days)]
+    now = datetime.now(ist).replace(tzinfo=None)
+    return [DailyActivityResponse(date=(now - timedelta(days=days-i-1)).strftime("%Y-%m-%d"), count=results.get((now - timedelta(days=days-i-1)).strftime("%Y-%m-%d"), 0)) for i in range(days)]
 
 @APP.get("/reconciliations/history")
 async def get_reconciliation_history(current_user: UserInDB = Depends(get_current_user), limit: int = 50, skip: int = 0):
@@ -2199,11 +2212,14 @@ async def reconcile_step4(
                 if "Patient Name" in final_matched.columns:
                     unique_patients = len(final_matched["Patient Name"].unique())
 
+                ist = pytz.timezone('Asia/Kolkata')
+                timestamp = datetime.now(ist).replace(tzinfo=None)
+
                 rec_doc = {
                     "username": current_user.username,
                     "run_id": run_id,
-                    "timestamp": datetime.utcnow(),
-                    "created_at": datetime.utcnow(),
+                    "timestamp": timestamp,
+                    "created_at": timestamp,
                     "bank_type": CURRENT_BANK_TYPE or "Unknown",
                     "tpa_name": tpa,
                     "status": "Completed",
@@ -2359,8 +2375,6 @@ async def reconcile_v2_step3(
         
         # Clean Outstanding
         out_clean = parse_outstanding_excel_to_clean_v2(out_path)
-        # Note: Requirement says "Saves 07_final_posting_sheet.xlsx". 
-        # Usually step 4 in V1 produces "06_outstanding...". I'll save cleaned just in case.
         save_xlsx(out_clean, CURRENT_RUN_DIR / "06_outstanding_cleaned.xlsx")
         
         # Match Step 2 (Mapped) <-> Outstanding
@@ -2385,25 +2399,67 @@ async def reconcile_v2_step3(
                 with open(zip_path, "rb") as zf:
                     fid = fs.put(zf, filename=f"{run_id}_v2.zip", username=current_user.username)
                 
-                # Fetch TPA from previous step log
+                # Fetch Bank Type & TPA from previous logs
+                # Ensure bank_type is not just "Unknown" if global is lost
+                bank_type = CURRENT_BANK_TYPE
                 tpa = "Unknown"
+                
                 if activity_logs_collection is not None:
-                     last = activity_logs_collection.find_one({"username": current_user.username, "run_id": run_id, "step_completed": 2})
-                     if last: tpa = last.get("tpa_name", "Unknown")
+                    # Try to find bank_type from Step 1 log if CURRENT_BANK_TYPE is unset
+                    if not bank_type:
+                        step1_log = activity_logs_collection.find_one({"username": current_user.username, "run_id": run_id, "step_completed": 1})
+                        if step1_log and "bank_type" in step1_log:
+                             bank_type = step1_log["bank_type"]
 
+                    # Try to find TPA from Step 2 log
+                    step2_log = activity_logs_collection.find_one({"username": current_user.username, "run_id": run_id, "step_completed": 2})
+                    if step2_log: tpa = step2_log.get("tpa_name", "Unknown")
+
+                if not bank_type: bank_type = "Unknown"
+
+                # Calculate Summary Stats for V1 compatibility
                 total_amount = 0.0
                 if "Transaction Amount(INR)_bank" in final_matched.columns:
                      total_amount = final_matched["Transaction Amount(INR)_bank"].apply(_to_amt).sum()
+
+                # Gather counts
+                comp_counts = {}
+                try:
+                    s2_mapped = CURRENT_RUN_DIR / "05_bank_mis_mapped.xlsx"
+                    if s2_mapped.exists(): comp_counts["step2_matches"] = len(pd.read_excel(s2_mapped))
+                    # Note: V2 Step 2 matches are conceptually similar to V1 Step 2 matches (Bank x Advance ? No, Bank x MIS)
+                    # V2 pipeline is shorter: Bank -> Match MIS -> Match Outstanding.
+                    # Mapping V2 stats to V1 keys for frontend compatibility:
+                    # step2_matches -> V2 Step 2 (Bank x MIS) matches
+                    # step4_outstanding -> V2 Step 3 (Final Matches)
+                    comp_counts["step3_mis_mapped"] = comp_counts.get("step2_matches", 0) # Reuse
+                except: pass
+
+                unique_patients = 0
+                if "Patient Name" in final_matched.columns:
+                    unique_patients = len(final_matched["Patient Name"].unique())
                 
+                # IST Time
+                ist = pytz.timezone('Asia/Kolkata')
+                timestamp = datetime.now(ist).replace(tzinfo=None)
+
                 rec_doc = {
-                    "username": current_user.username, "run_id": run_id,
-                    "timestamp": datetime.utcnow(), "created_at": datetime.utcnow(),
-                    "bank_type": CURRENT_BANK_TYPE or "Unknown", "tpa_name": tpa,
-                    "status": "Completed", "pipeline": "v2",
+                    "username": current_user.username,
+                    "run_id": run_id,
+                    "timestamp": timestamp,
+                    "created_at": timestamp, # redundancy
+                    "bank_type": bank_type,
+                    "tpa_name": tpa,
+                    "status": "Completed",
+                    "pipeline_mode": "v2",
                     "summary": {
-                        "step4_outstanding": len(final_matched),
+                        "step4_outstanding": int(len(final_matched)),
                         "total_amount": float(total_amount),
-                        "unmatched_count": len(final_unmatched)
+                        "unique_patients": int(unique_patients),
+                        "step2_matches": int(comp_counts.get("step2_matches", 0)),
+                        "step2_not_in": 0, # Not tracked same way in V2
+                        "step3_mis_mapped": int(comp_counts.get("step3_mis_mapped", 0)),
+                        "unmatched_count": int(len(final_unmatched))
                     },
                     "zip_file_id": str(fid)
                 }
@@ -2411,7 +2467,7 @@ async def reconcile_v2_step3(
             except Exception as e: print(f"DB Error: {e}")
 
         if current_user:
-            log_activity(current_user.username, CURRENT_BANK_TYPE, 3, run_id, 
+            log_activity(current_user.username, CURRENT_BANK_TYPE or "Unknown", 3, run_id, 
                         counts={"final": len(final_matched)}, success=True)
             
         return {
@@ -2425,6 +2481,8 @@ async def reconcile_v2_step3(
         }
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(400, detail=str(e))
 
 @APP.post("/reconcile/v2/bulk")
@@ -2451,18 +2509,29 @@ async def reconcile_v2_bulk(
         consolidated_frames = [] # List to hold all final match DFs
         files_resp = {}  # Map of "filename" -> "download_url"
 
+        # Stats Aggregation
+        agg_stats = {
+            "step1_bank_rows": 0,
+            "step2_matches": 0,
+            "step3_mis_mapped": 0,
+            "step4_outstanding": 0, # Final Matches
+            "total_amount": 0.0,
+            "unique_patients_set": set() # Use set to track uniqueness across all
+        }
+        
+        detected_banks = set()
+        detected_tpas = set()
+
         # Helper to register file
         def _reg_file(abs_path: Path):
             rel_path = abs_path.relative_to(CURRENT_RUN_DIR)
-            # Encode path separators for URL if needed, but here we just pass the relative path string
-            # The download endpoint now handles "filename:path" so slashes are fine
             files_resp[str(rel_path)] = f"/download/{run_id}/{str(rel_path)}"
             return str(rel_path)
         
         # Register global files
         _reg_file(CURRENT_RUN_DIR / "00_outstanding_cleaned.xlsx")
 
-        # Save MIS files locally first to avoid repeated reading/seeking issues
+        # Save MIS files locally first
         mis_paths = []
         for mf in mis_files:
             m_path = CURRENT_RUN_DIR / f"raw_mis_{mf.filename}"
@@ -2482,11 +2551,15 @@ async def reconcile_v2_bulk(
             try:
                 # Detect & Clean Bank
                 b_type = detect_bank_type(b_path)
+                detected_banks.add(b_type)
+                
                 if b_type == "ICICI":
                     bank_clean = clean_raw_bank_statement_icici_v2(b_path)
                 else:
                     bank_clean = clean_raw_bank_statement_axis_v2(b_path)
                 
+                agg_stats["step1_bank_rows"] += len(bank_clean)
+
                 # 3. Iterate MIS
                 for m_filename, m_path in mis_paths:
                     m_stem = Path(m_filename).stem
@@ -2497,14 +2570,29 @@ async def reconcile_v2_bulk(
                     try:
                         # Detect TPA & Clean
                         tpa = detect_tpa_choice(m_path)
+                        detected_tpas.add(tpa)
+                        
                         mis_clean_df = parse_mis_universal_v2(m_path, tpa)
                         
                         # Step 2 Match
                         step2_match, _ = step2_match_bank_mis_by_utr_v2(bank_clean, mis_clean_df, tpa)
+                        agg_stats["step2_matches"] += len(step2_match)
+                        agg_stats["step3_mis_mapped"] += len(step2_match) # Reuse for compat
                         
                         # Step 4 Match (Strict)
                         final_match, final_unmatched = step4_strict_matches_v2(step2_match, outstanding_df=out_clean_df)
                         
+                        # Aggregate Final Stats
+                        agg_stats["step4_outstanding"] += len(final_match)
+                        
+                        if "Transaction Amount(INR)_bank" in final_match.columns:
+                             amt = final_match["Transaction Amount(INR)_bank"].apply(_to_amt).sum()
+                             agg_stats["total_amount"] += amt
+                        
+                        if "Patient Name" in final_match.columns:
+                            pats = final_match["Patient Name"].dropna().unique()
+                            agg_stats["unique_patients_set"].update(pats)
+
                         # Logic to add to consolidated list
                         try:
                             final_match_copy = final_match.copy()
@@ -2567,7 +2655,6 @@ async def reconcile_v2_bulk(
         try:
             if consolidated_frames:
                 master_df = pd.concat(consolidated_frames, ignore_index=True)
-                # Save it
                 master_path = CURRENT_RUN_DIR / "Consolidated_Matches.xlsx"
                 save_xlsx(master_df, master_path)
                 _reg_file(master_path)
@@ -2588,6 +2675,64 @@ async def reconcile_v2_bulk(
         
         # Register Zip
         files_resp[final_zip_name] = f"/download/{run_id}/{final_zip_name}"
+
+        # --- DB SAVING LOGIC (BULK) ---
+        if current_user and reconciliation_results_collection is not None and fs is not None:
+             try:
+                # 1. Upload Zip to GridFS
+                zip_path = CURRENT_RUN_DIR / final_zip_name
+                with open(zip_path, "rb") as zf:
+                    fid = fs.put(zf, filename=final_zip_name, username=current_user.username)
+                
+                # 2. Determine Bank Type & TPA
+                final_bank_type = list(detected_banks)[0] if len(detected_banks) == 1 else "Multiple"
+                if len(detected_banks) == 0: final_bank_type = "Unknown"
+                
+                final_tpa_name = list(detected_tpas)[0] if len(detected_tpas) == 1 else "Multiple"
+                if len(detected_tpas) == 0: final_tpa_name = "Unknown"
+
+                # 3. IST Time
+                ist = pytz.timezone('Asia/Kolkata')
+                timestamp = datetime.now(ist).replace(tzinfo=None)
+
+                # 4. Insert Record
+                rec_doc = {
+                    "username": current_user.username,
+                    "run_id": run_id,
+                    "timestamp": timestamp,
+                    "created_at": timestamp,
+                    "bank_type": final_bank_type,
+                    "tpa_name": final_tpa_name,
+                    "status": "Completed", 
+                    "pipeline_mode": "v2_bulk",
+                    "files": files_resp, # Save map of files
+                    "summary": {
+                        "step4_outstanding": int(agg_stats["step4_outstanding"]),
+                        "total_amount": float(agg_stats["total_amount"]),
+                        "unique_patients": int(len(agg_stats["unique_patients_set"])),
+                        "step2_matches": int(agg_stats["step2_matches"]),
+                        "step1_bank_rows": int(agg_stats["step1_bank_rows"]),
+                        "step3_mis_mapped": int(agg_stats["step3_mis_mapped"])
+                    },
+                    "zip_file_id": str(fid)
+                }
+                reconciliation_results_collection.insert_one(rec_doc)
+                print(f"[DB] Saved Bulk history for {run_id}")
+
+             except Exception as e:
+                 print(f"[DB Save Error Bulk] {str(e)}")
+        
+        if current_user:
+            # Force log activity for Bulk run so it shows up in Profile
+            log_activity(
+                username=current_user.username, 
+                bank_type=final_bank_type, 
+                step=4, 
+                run_id=run_id, 
+                counts={"final": agg_stats["step4_outstanding"]}, 
+                success=True,
+                tpa=final_tpa_name
+            )
         
         return {
             "status": "success",

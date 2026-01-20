@@ -125,6 +125,8 @@ class ReconciliationResult(BaseModel):
     tpa_name: Optional[str] = None
     summary: ReconciliationSummary
     zip_file_id: str  # GridFS file ID for the ZIP
+    pipeline_mode: Optional[str] = "v1" # "v1", "v2", "v2_bulk"
+    files: Optional[Dict[str, str]] = None # Map of filename -> download_url
 
 class ReconciliationHistoryResponse(BaseModel):
     """Response for history list"""
