@@ -147,10 +147,10 @@ TPA_MIS_MAPS_V2 = {
         "Cheque/ NEFT/ UTR No.": "UTR_NO",
         "Claim No": "REF_CCN"
     },
-    "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED v2": {
-        "Cheque/ NEFT/ UTR No.": "UTR No",
-        "Claim No": "REF_CCN"
-    },
+    # "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED v2": {
+    #     "Cheque/ NEFT/ UTR No.": "UTR No",
+    #     "Claim No": "REF_CCN"
+    # },
     "MEDSAVE HEALTHCARE TPA PVT LTD": {
         "Cheque/ NEFT/ UTR No.": "UTR/Chq No.",
         "Claim No": "Claim Number"
