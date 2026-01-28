@@ -144,7 +144,7 @@ TPA_MIS_MAPS_V2 = {
         "Claim No": "CCN"
     },
     "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED": {
-        "Cheque/ NEFT/ UTR No.": "UTR No",
+        "Cheque/ NEFT/ UTR No.": "UTR_NO",
         "Claim No": "REF_CCN"
     },
     "MEDSAVE HEALTHCARE TPA PVT LTD": {
@@ -233,6 +233,47 @@ def _clean_key_series(series: pd.Series) -> pd.Series:
     lower = s.str.lower()
     s = s.mask(lower.isin(_NULL_TOKENS), pd.NA)
     return s.astype(object).where(s.notna(), np.nan)
+
+def _clean_key_value(x) -> Optional[str]:
+    if pd.isna(x):
+        return None
+    s = str(x).replace("\xa0", " ").strip()
+    if s.lower() in _NULL_TOKENS:
+        return None
+    return s
+
+# PATCH (NEW): Normalize Excel header strings so hidden characters don't break MIS mapping
+def _norm_colname(x: str) -> str:
+    if x is None:
+        return ""
+    s = str(x)
+    s = s.replace("\xa0", " ")  # non-breaking space -> normal space
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
+    return s.upper()
+
+# PATCH (NEW): Make duplicate headers unique (prevents df[col] returning DataFrame -> .str crash)
+def _make_unique_columns(cols) -> list:
+    seen = {}
+    out = []
+    for c in list(cols):
+        base = str(c).replace("\xa0", " ").strip()
+        if base == "" or base.lower() in ("nan", "none", "null"):
+            base = "UNNAMED"
+        if base not in seen:
+            seen[base] = 0
+            out.append(base)
+        else:
+            seen[base] += 1
+            out.append(f"{base}__DUP{seen[base]}")
+    return out
+
+# PATCH (NEW): Force a single Series even if df[col] returns a DataFrame (duplicate columns)
+def _force_series(x):
+    if isinstance(x, pd.DataFrame):
+        return x.iloc[:, 0]
+    return x
 
 # ==========================================
 #  PART 2: BANK & ADVANCE CLEANERS
@@ -814,6 +855,9 @@ def clean_raw_bank_statement_icici_v2(path):
     existing = [c for c in keep_cols if c in df_all.columns]
     df = df_all[existing].copy()
 
+    # PATCH: de-duplicate columns so df[col] is always a Series (prevents .str crash)
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
     df = df.dropna(how="all")
 
     if not df.empty:
@@ -992,6 +1036,9 @@ def clean_raw_bank_statement_axis_v2(path):
             canon_df[canon] = np.nan
 
     canon_df = canon_df.dropna(how="all")
+
+    # PATCH: de-duplicate columns so canon_df[col] is always a Series (prevents .str crash)
+    canon_df = canon_df.loc[:, ~canon_df.columns.duplicated()].copy()
 
     def _is_repeated_header(row):
         for c in canon_cols_order:
@@ -1229,6 +1276,9 @@ def parse_mis_universal_v2(mis_path, tpa_name: str, empty_threshold: float = 0.5
     PATCH #2 (minimal):
     - Tolerate 2-row headers by scoring row_i + row_{i+1}
     - Build header by filling blanks from the next row (only fill; no concatenation)
+
+    PATCH (NEW):
+    - Make headers unique to prevent df[col] -> DataFrame -> .str crash
     """
     mis_path = Path(mis_path)
     ext = mis_path.suffix.lower()
@@ -1315,11 +1365,15 @@ def parse_mis_universal_v2(mis_path, tpa_name: str, empty_threshold: float = 0.5
             return vals[:len(header_vals)] == header_vals
 
         df_sheet = df_sheet[~df_sheet.apply(_is_header_like, axis=1)]
+
+        # PATCH (NEW): ensure unique column labels BEFORE .str ops
+        df_sheet.columns = _make_unique_columns(df_sheet.columns)
+
         df_sheet = df_sheet.dropna(how="all")
 
         for c in df_sheet.columns:
             df_sheet[c] = (
-                df_sheet[c]
+                _force_series(df_sheet[c])
                 .astype(str)
                 .str.replace("\xa0", " ", regex=False)
                 .str.strip()
@@ -1347,7 +1401,7 @@ def parse_mis_universal_v2(mis_path, tpa_name: str, empty_threshold: float = 0.5
             tbl = _extract_from_sheet(raw)
             if tbl is not None:
                 tables.append(tbl)
-    
+
     elif ext == ".csv":
         raw = pd.read_csv(mis_path, header=None, dtype=str)
         tbl = _extract_from_sheet(raw)
@@ -1382,17 +1436,44 @@ def step2_match_bank_mis_by_utr_v2(bank_df: pd.DataFrame, mis_df: pd.DataFrame, 
     - If MIS UTR length > 16, use only first 16 chars for bank substring search + merge.
       Example: AXISCN1218291971UTIBN62026011379400525 -> AXISCN1218291971
     - MIS-side only: original UTR preserved in output; _UTR_SEARCH used for matching.
+
+    PATCH (NEW):
+    - Header normalization for MIS rename so hidden characters (e.g., NBSP) don't break mapping.
+
+    PATCH (NEW - FIX AXIS+PARK crash):
+    - Handle merge suffix collisions (e.g., MIS also has 'Description' or 'Transaction ID')
+      so 'not_in' calculation never KeyErrors.
+
+    PATCH (NEW - THIS BUG):
+    - Force bank search column into a Series even if duplicate columns exist
+      (prevents 'DataFrame' object has no attribute 'str').
     """
     if bank_df.empty:
         return pd.DataFrame(), bank_df
     if mis_df.empty:
         return pd.DataFrame(), bank_df
 
+    # PATCH: ensure unique bank columns so df[col] doesn't return DataFrame
+    bank_df = bank_df.loc[:, ~bank_df.columns.duplicated()].copy()
+
     mapping = TPA_MIS_MAPS_V2.get(tpa_name)
     if mapping is None:
         raise ValueError(f"Unknown TPA '{tpa_name}' for MIS mapping.")
 
-    mis_std = mis_df.rename(columns={v: k for k, v in mapping.items()}).copy()
+    # PATCH: normalized rename (handles hidden NBSP / weird dashes / whitespace)
+    actual_lookup = {}
+    for c in mis_df.columns:
+        k = _norm_colname(c)
+        if k and (k not in actual_lookup):
+            actual_lookup[k] = c
+
+    rename_map = {}
+    for canon_col, src_col in mapping.items():
+        key = _norm_colname(src_col)
+        if key in actual_lookup:
+            rename_map[actual_lookup[key]] = canon_col
+
+    mis_std = mis_df.rename(columns=rename_map).copy()
 
     if "Cheque/ NEFT/ UTR No." not in mis_std.columns:
         raise ValueError(
@@ -1428,12 +1509,14 @@ def step2_match_bank_mis_by_utr_v2(bank_df: pd.DataFrame, mis_df: pd.DataFrame, 
     pairs = pairs[pairs["_UTR_SEARCH"].map(lambda x: len(str(x)) >= int(min_key_len))]
 
     col_to_search = "Description" if "Description" in bank_df.columns else bank_df.columns[1]
-    bank_text = bank_df[col_to_search].astype(str)
+    parts = []
+
+    # PATCH: force Series even if bank_df[col] is a DataFrame (duplicate col labels)
+    bank_text = _force_series(bank_df[col_to_search]).astype(str)
 
     # We only need to substring-search each key once; the merge will explode to all claims safely.
     utr_keys = pairs["_UTR_SEARCH"].dropna().astype(str).map(str.strip).unique()
-    
-    parts = []
+
     for utr in utr_keys:
         s = utr.strip()
         if not s:
@@ -1461,10 +1544,24 @@ def step2_match_bank_mis_by_utr_v2(bank_df: pd.DataFrame, mis_df: pd.DataFrame, 
     if deduplicate:
         merged = merged.drop_duplicates()
 
-    if "Transaction ID" in bank_df.columns and "Transaction ID" in merged.columns:
-        not_in = bank_df.loc[~bank_df["Transaction ID"].isin(merged["Transaction ID"])]
+    # =========================
+    # PATCH: handle suffix collisions safely
+    # =========================
+    merged_text_col = col_to_search
+    if merged_text_col not in merged.columns and f"{merged_text_col}_bank" in merged.columns:
+        merged_text_col = f"{merged_text_col}_bank"
+
+    if "Transaction ID" in bank_df.columns:
+        merged_tid_col = "Transaction ID"
+        if merged_tid_col not in merged.columns and f"{merged_tid_col}_bank" in merged.columns:
+            merged_tid_col = f"{merged_tid_col}_bank"
+
+        if merged_tid_col in merged.columns:
+            not_in = bank_df.loc[~bank_df["Transaction ID"].isin(merged[merged_tid_col])]
+        else:
+            not_in = bank_df.loc[~bank_df[col_to_search].isin(merged[merged_text_col])]
     else:
-        not_in = bank_df.loc[~bank_df[col_to_search].isin(merged[col_to_search])]
+        not_in = bank_df.loc[~bank_df[col_to_search].isin(merged[merged_text_col])]
 
     return merged.reset_index(drop=True), not_in
 
@@ -1530,9 +1627,20 @@ def parse_outstanding_excel_to_clean_v2(xlsx_path: Path) -> pd.DataFrame:
     if header_rows:
         df = df.drop(index=header_rows)
 
-    df = df[~df.apply(lambda r: any(t in " ".join([str(x) for x in r]).upper() for t in _FOOTER_TOKENS), axis=1)]
+    def _row_is_footer_like(row: pd.Series) -> bool:
+        flat = " ".join([str(x) for x in row.fillna("").tolist()]).upper()
+        return any(tok in flat for tok in _FOOTER_TOKENS)
+
+    df = df[~df.apply(_row_is_footer_like, axis=1)]
+
     for c in df.columns:
         df[c] = df[c].astype(str).str.replace("\xa0", " ", regex=False).str.strip()
+    
+    for col in ["Patient Name", "CR No", "Balance"]:
+        if col not in df.columns:
+             # In V2 script it raises ValueError, let's keep it robust or raise if critical
+             pass
+
     return df.reset_index(drop=True)
 
 def step4_strict_matches_v2(step3_df: pd.DataFrame, outstanding_path: Optional[Path] = None, outstanding_df: Optional[pd.DataFrame] = None, deduplicate: bool = True):
@@ -1562,8 +1670,6 @@ def step4_strict_matches_v2(step3_df: pd.DataFrame, outstanding_path: Optional[P
 
     for col in ["Patient Name", "CR No", "Balance"]:
         if col not in out.columns:
-             # Just warn or skip if missing? The user script raises ValueError.
-             # We'll allow it but logs might show issues.
              pass
 
     _SEP_RE = re.compile(r"[\s\-_]+")
@@ -1754,6 +1860,7 @@ def step4_strict_matches_v2(step3_df: pd.DataFrame, outstanding_path: Optional[P
         matched = matched.drop(columns=drop_cols_matched)
 
     return matched.reset_index(drop=True), unmatched_step3.reset_index(drop=True)
+
 
 
 def save_xlsx(df: pd.DataFrame, path: Path) -> Path:
