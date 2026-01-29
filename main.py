@@ -9,6 +9,7 @@ import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from bs4 import BeautifulSoup
 
 # ==========================================
 #  AUTHENTICATION SETUP
@@ -125,6 +126,132 @@ TPA_MIS_MAPS = {
 TPA_CHOICES = list(TPA_MIS_MAPS.keys())
 
 # ==========================================
+#  PART 0: FILE NORMALISER (ALL -> .XLSX)
+#  (NEW - ONLY ADDITION)
+# ==========================================
+
+_CONVERTED_DIR = Path("_converted")
+_CONVERTED_DIR.mkdir(exist_ok=True)
+
+def _is_html_disguised_xls(p: Path) -> bool:
+    try:
+        head = p.read_bytes()[:4096].lower()
+        return (b"<html" in head) or (b"<table" in head) or (b"<!doctype html" in head)
+    except Exception:
+        return False
+
+def _html_table_to_grid(html_bytes: bytes):
+    """
+    Parse FIRST <table> into a 2D grid of strings.
+    Preserves all rows exactly (no header inference).
+    Expands colspan so the grid shape stays consistent.
+    """
+    soup = BeautifulSoup(html_bytes, "lxml")
+    table = soup.find("table")
+    if table is None:
+        raise ValueError("HTML-backed .xls detected, but no <table> found.")
+
+    rows = table.find_all("tr")
+    grid = []
+
+    for tr in rows:
+        row_cells = []
+        tds = tr.find_all(["td", "th"])
+        for cell in tds:
+            text = cell.get_text(separator=" ", strip=True)
+            colspan = int(cell.get("colspan", 1) or 1)
+
+            row_cells.append(text)
+            for _ in range(colspan - 1):
+                row_cells.append("")
+        grid.append(row_cells)
+
+    max_cols = max((len(r) for r in grid), default=0)
+    for r in grid:
+        if len(r) < max_cols:
+            r.extend([""] * (max_cols - len(r)))
+
+    return grid
+
+def normalize_to_xlsx(src_path: Path) -> Path:
+    """
+    NORMALISE EVERYTHING to a fresh .xlsx (CloudConvert/Excel Save-As feel):
+    - .xls, .xlsx, .xlsm, .csv -> .xlsx
+    - Preserves ALL rows (no header inference)
+    - Reads as text (no numeric/date coercion)
+    - .xlsm macros are dropped by design
+    - Handles HTML-disguised .xls (very common exports)
+    """
+    src_path = Path(src_path)
+    if not src_path.exists():
+        raise FileNotFoundError(src_path)
+
+    # Use a temp dir for converted files if preferred, or globally defined _CONVERTED_DIR
+    # Ensure usage of absolute path if needed
+    out_path = _CONVERTED_DIR / f"{src_path.stem}__to_xlsx_exact.xlsx"
+    ext = src_path.suffix.lower()
+
+    if ext == ".csv":
+        df = pd.read_csv(src_path, dtype=str, header=None)
+        df.to_excel(out_path, index=False, header=False)
+        return out_path
+
+    if ext == ".xls" and _is_html_disguised_xls(src_path):
+        grid = _html_table_to_grid(src_path.read_bytes())
+        df = pd.DataFrame(grid)
+        df.to_excel(out_path, index=False, header=False)
+        return out_path
+
+    if ext in [".xls", ".xlsx", ".xlsm"]:
+        # If openpyxl fails on old xls, pandas might use xlrd.
+        # But for 'strict' xls normalization we often trust pandas defaults or explicit engines.
+        # The user script uses 'openpyxl' engine in the writer.
+        # Strategy:
+        # 1. Try generic auto-detect.
+        # 2. If fail, clean exception and fallback based on extension.
+        # 3. If specific engine fails, ALWAYS try HTML check as hail mary.
+        try:
+             xls = pd.ExcelFile(src_path)
+        except Exception:
+             # Auto-detect failed. Try robust fallback sequence.
+             xls = None
+             
+             # Sub-Strategy A: If looks like XLS, try xlrd
+             if ext == ".xls":
+                 try: 
+                    xls = pd.ExcelFile(src_path, engine="xlrd") 
+                 except: pass
+            
+             # Sub-Strategy B: If looks like XLSX, try openpyxl
+             if xls is None and ext in [".xlsx", ".xlsm"]:
+                 try: 
+                    xls = pd.ExcelFile(src_path, engine="openpyxl") 
+                 except: pass
+
+             # Sub-Strategy C: If still None, it might be HTML disguised as anything
+             if xls is None:
+                 if _is_html_disguised_xls(src_path):
+                    try:
+                        grid = _html_table_to_grid(src_path.read_bytes())
+                        df = pd.DataFrame(grid)
+                        df.to_excel(out_path, index=False, header=False)
+                        return out_path
+                    except: pass
+                 
+                 # If we are here, we really can't read it.
+                 # Re-raise the original issue or a new one
+                 raise ValueError(f"Could not parse file {src_path.name}. Tried auto, specific engine, and HTML fallback.")
+        
+        # If we got an xls object, write it out
+        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+            for sheet in xls.sheet_names:
+                df = xls.parse(sheet_name=sheet, dtype=str, header=None)
+                df.to_excel(writer, sheet_name=str(sheet)[:31], index=False, header=False)
+        return out_path
+
+    raise ValueError(f"Unsupported file type for normalization: {ext}")
+
+# ==========================================
 #  V2 PIPELINE CONFIGURATION
 # ==========================================
 
@@ -147,18 +274,14 @@ TPA_MIS_MAPS_V2 = {
         "Cheque/ NEFT/ UTR No.": "UTR_NO",
         "Claim No": "REF_CCN"
     },
-    # "HERITAGE HEALTH INSURANCE TPA PRIVATE LIMITED v2": {
-    #     "Cheque/ NEFT/ UTR No.": "UTR No",
-    #     "Claim No": "REF_CCN"
-    # },
     "MEDSAVE HEALTHCARE TPA PVT LTD": {
         "Cheque/ NEFT/ UTR No.": "UTR/Chq No.",
-        "Claim No": "Claim Number"
+        "Claim No": "FILENO"
     },
-    "PARAMOUNT HEALTHCARE": {
-        "Cheque/ NEFT/ UTR No.": "UTR_NO",
-        "Claim No": "Claim Number"
-    },
+    # "PARAMOUNT HEALTHCARE": {
+    #     "Cheque/ NEFT/ UTR No.": "UTR_NO",
+    #     "Claim No": "Claim Number"
+    # },
     "PARK MEDICLAIM INSURANCE TPA PRIVATE LIMITED": {
         "Cheque/ NEFT/ UTR No.": "Chq No",
         "Claim No": "Claim Number"
@@ -1639,11 +1762,11 @@ def parse_outstanding_excel_to_clean_v2(xlsx_path: Path) -> pd.DataFrame:
 
     for c in df.columns:
         df[c] = df[c].astype(str).str.replace("\xa0", " ", regex=False).str.strip()
-    
+
     for col in ["Patient Name", "CR No", "Balance"]:
         if col not in df.columns:
-             # In V2 script it raises ValueError, let's keep it robust or raise if critical
-             pass
+            # We assume it's acceptable if missing or raise
+            pass
 
     return df.reset_index(drop=True)
 
@@ -2393,15 +2516,18 @@ async def reconcile_v2_step1(
         
         bank_path = CURRENT_RUN_DIR / "bank_raw.xlsx" # use generic name initially
         with open(bank_path, "wb") as f: f.write(await bank_file.read())
+
+        # NORMALIZE (NEW)
+        norm_bank = normalize_to_xlsx(bank_path)
         
         # Detect Bank
-        CURRENT_BANK_TYPE = detect_bank_type(bank_path)
+        CURRENT_BANK_TYPE = detect_bank_type(norm_bank)
         
         # Clean
         if CURRENT_BANK_TYPE == "ICICI":
-            bank_df = clean_raw_bank_statement_icici_v2(bank_path)
+            bank_df = clean_raw_bank_statement_icici_v2(norm_bank)
         else:
-            bank_df = clean_raw_bank_statement_axis_v2(bank_path)
+            bank_df = clean_raw_bank_statement_axis_v2(norm_bank)
             
         out_bank = save_xlsx(bank_df, CURRENT_RUN_DIR / "01_bank_clean.xlsx")
         
@@ -2435,11 +2561,14 @@ async def reconcile_v2_step2(
         mis_path = CURRENT_RUN_DIR / "mis_raw.xlsx"
         with open(mis_path, "wb") as f: f.write(await mis_file.read())
         
+        # NORMALIZE (NEW)
+        norm_mis = normalize_to_xlsx(mis_path)
+        
         # Detect TPA
-        tpa_name = detect_tpa_choice(mis_path)
+        tpa_name = detect_tpa_choice(norm_mis)
         
         # Clean MIS
-        mis_clean = parse_mis_universal_v2(mis_path, tpa_name)
+        mis_clean = parse_mis_universal_v2(norm_mis, tpa_name)
         out_mis = save_xlsx(mis_clean, CURRENT_RUN_DIR / "04_mis_cleaned.xlsx")
         
         # Match Bank <-> MIS
@@ -2484,8 +2613,11 @@ async def reconcile_v2_step3(
         out_path = CURRENT_RUN_DIR / "outstanding_raw.xlsx"
         with open(out_path, "wb") as f: f.write(await outstanding_file.read())
         
+        # NORMALIZE (NEW)
+        norm_out = normalize_to_xlsx(out_path)
+        
         # Clean Outstanding
-        out_clean = parse_outstanding_excel_to_clean_v2(out_path)
+        out_clean = parse_outstanding_excel_to_clean_v2(norm_out)
         save_xlsx(out_clean, CURRENT_RUN_DIR / "06_outstanding_cleaned.xlsx")
         
         # Match Step 2 (Mapped) <-> Outstanding
@@ -2493,7 +2625,7 @@ async def reconcile_v2_step3(
         if not s2_path.exists(): raise HTTPException(400, "Step 2 mapped output missing")
         s2_df = pd.read_excel(s2_path, dtype=str)
         
-        final_matched, final_unmatched = step4_strict_matches_v2(s2_df, out_path, deduplicate=True)
+        final_matched, final_unmatched = step4_strict_matches_v2(s2_df, outstanding_df=out_clean, deduplicate=True)
         
         out_final = save_xlsx(final_matched, CURRENT_RUN_DIR / "07_final_posting_sheet.xlsx")
         out_unmatched = save_xlsx(final_unmatched, CURRENT_RUN_DIR / "07b_final_unmatched.xlsx")
@@ -2613,7 +2745,9 @@ async def reconcile_v2_bulk(
         out_path = CURRENT_RUN_DIR / "outstanding.xlsx"
         with open(out_path, "wb") as f: f.write(await outstanding_file.read())
         
-        out_clean_df = parse_outstanding_excel_to_clean_v2(out_path)
+        norm_out = normalize_to_xlsx(out_path)
+        
+        out_clean_df = parse_outstanding_excel_to_clean_v2(norm_out)
         save_xlsx(out_clean_df, CURRENT_RUN_DIR / "00_outstanding_cleaned.xlsx")
         
         summary_rows = []
@@ -2661,13 +2795,14 @@ async def reconcile_v2_bulk(
             
             try:
                 # Detect & Clean Bank
-                b_type = detect_bank_type(b_path)
+                b_norm = normalize_to_xlsx(b_path)
+                b_type = detect_bank_type(b_norm)
                 detected_banks.add(b_type)
                 
                 if b_type == "ICICI":
-                    bank_clean = clean_raw_bank_statement_icici_v2(b_path)
+                    bank_clean = clean_raw_bank_statement_icici_v2(b_norm)
                 else:
-                    bank_clean = clean_raw_bank_statement_axis_v2(b_path)
+                    bank_clean = clean_raw_bank_statement_axis_v2(b_norm)
                 
                 agg_stats["step1_bank_rows"] += len(bank_clean)
 
@@ -2680,10 +2815,11 @@ async def reconcile_v2_bulk(
                     
                     try:
                         # Detect TPA & Clean
-                        tpa = detect_tpa_choice(m_path)
+                        m_norm = normalize_to_xlsx(m_path)
+                        tpa = detect_tpa_choice(m_norm)
                         detected_tpas.add(tpa)
                         
-                        mis_clean_df = parse_mis_universal_v2(m_path, tpa)
+                        mis_clean_df = parse_mis_universal_v2(m_norm, tpa)
                         
                         # Step 2 Match
                         step2_match, _ = step2_match_bank_mis_by_utr_v2(bank_clean, mis_clean_df, tpa)
