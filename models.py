@@ -53,6 +53,7 @@ class UserInDB(BaseModel):
     hashed_password: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
     is_active: bool = True
+    is_admin: bool = False
     email_verified: bool = False
     verification_token: Optional[str] = None
     verification_token_expires: Optional[datetime] = None
@@ -62,6 +63,7 @@ class UserResponse(BaseModel):
     email: Optional[str] = None
     full_name: Optional[str] = None
     created_at: datetime
+    is_admin: bool = False
     email_verified: bool = False
 
 # Activity Log Models
@@ -131,6 +133,7 @@ class ReconciliationResult(BaseModel):
 class ReconciliationHistoryResponse(BaseModel):
     """Response for history list"""
     run_id: str
+    username: str
     timestamp: datetime
     bank_type: str
     tpa_name: Optional[str]

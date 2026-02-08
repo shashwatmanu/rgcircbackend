@@ -63,7 +63,7 @@ else:
         reconciliation_results_collection.create_index([("username", 1), ("timestamp", -1)])
         
         # Ensure TTL index reflects desired retention policy (40 days)
-        TTL_SECONDS = 40 * 24 * 60 * 60
+        TTL_SECONDS = 14 * 24 * 60 * 60
         existing_indexes = reconciliation_results_collection.index_information()
         timestamp_index = existing_indexes.get("timestamp_1")
         if timestamp_index:
