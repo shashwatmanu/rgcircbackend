@@ -47,7 +47,8 @@ try:
         UserRegister, UserLogin, Token, UserResponse, UserInDB,
         ActivityLog, UserStatsResponse, ActivityResponse, DailyActivityResponse,
         ReconciliationHistoryResponse, ReconciliationSummary,
-        SendVerificationEmailRequest, VerifyEmailRequest
+        SendVerificationEmailRequest, VerifyEmailRequest,
+        ReconciliationFilesResponse
     )
     from database import users_collection, activity_logs_collection, reconciliation_results_collection, fs
     AUTH_ENABLED = True
@@ -536,6 +537,42 @@ async def download_reconciliation_zip(run_id: str, current_user: UserInDB = Depe
         print(f"[Download ZIP] Error: {e}")
         raise HTTPException(500, "Failed to retrieve file")
 
+@APP.get("/reconciliations/{run_id}/files")
+async def get_reconciliation_files(run_id: str, current_user: UserInDB = Depends(get_current_user)):
+    """Get list of files for a specific reconciliation run (user only)"""
+    if reconciliation_results_collection is None:
+        raise HTTPException(503, "DB unavailable")
+    
+    # Find reconciliation and verify ownership
+    result = reconciliation_results_collection.find_one({
+        "username": current_user.username, 
+        "run_id": run_id
+    }, {"_id": 0})
+    
+    if not result:
+        raise HTTPException(404, "Reconciliation not found")
+    
+    # Check if files are stored in DB (v2_bulk)
+    if "files" in result and result["files"]:
+        return {"run_id": run_id, "files": result["files"]}
+    
+    # Otherwise, reconstruct from disk (v1, v2 single)
+    run_dir = RUN_ROOT / run_id
+    if not run_dir.exists():
+        raise HTTPException(404, "Run directory not found")
+    
+    files = {}
+    # Common output files - include numbered outputs and key files
+    for file_path in run_dir.glob("*.xlsx"):
+        # Include numbered outputs (0*.xlsx) and important final files
+        if (file_path.name.startswith("0") or 
+            "final" in file_path.name.lower() or 
+            "summary" in file_path.name.lower() or
+            "posting" in file_path.name.lower()):
+            files[file_path.name] = f"/download/{run_id}/{file_path.name}"
+    
+    return {"run_id": run_id, "files": files}
+
 @APP.delete("/reconciliations/{run_id}")
 async def delete_reconciliation(run_id: str, current_user: UserInDB = Depends(get_current_user)):
     if reconciliation_results_collection is None or fs is None: raise HTTPException(503, "DB unavailable")
@@ -620,6 +657,37 @@ async def download_admin_reconciliation_zip(run_id: str, current_user: UserInDB 
         )
     except Exception as e:
         raise HTTPException(500, f"Error retrieving file: {str(e)}")
+
+@APP.get("/admin/reconciliations/{run_id}/files")
+async def get_admin_reconciliation_files(run_id: str, current_user: UserInDB = Depends(get_current_admin_user)):
+    """Admin only: Get list of files for ANY reconciliation run"""
+    if reconciliation_results_collection is None:
+        raise HTTPException(503, "DB unavailable")
+    
+    # Find reconciliation by run_id only (no username filter)
+    result = reconciliation_results_collection.find_one({"run_id": run_id}, {"_id": 0})
+    
+    if not result:
+        raise HTTPException(404, "Reconciliation not found")
+    
+    # Check if files are stored in DB (v2_bulk)
+    if "files" in result and result["files"]:
+        return {"run_id": run_id, "files": result["files"]}
+    
+    # Otherwise, reconstruct from disk (v1, v2 single)
+    run_dir = RUN_ROOT / run_id
+    if not run_dir.exists():
+        raise HTTPException(404, "Run directory not found")
+    
+    files = {}
+    for file_path in run_dir.glob("*.xlsx"):
+        if (file_path.name.startswith("0") or 
+            "final" in file_path.name.lower() or 
+            "summary" in file_path.name.lower() or
+            "posting" in file_path.name.lower()):
+            files[file_path.name] = f"/download/{run_id}/{file_path.name}"
+    
+    return {"run_id": run_id, "files": files}
 
 # ----------------- RECONCILIATION FLOW -----------------
 

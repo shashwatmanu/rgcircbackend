@@ -138,3 +138,8 @@ class ReconciliationHistoryResponse(BaseModel):
     bank_type: str
     tpa_name: Optional[str]
     summary: ReconciliationSummary
+
+class ReconciliationFilesResponse(BaseModel):
+    """Response model for reconciliation file list"""
+    run_id: str
+    files: Dict[str, str]  # filename -> download_url
