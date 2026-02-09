@@ -1,4 +1,4 @@
-import io, os, shutil, zipfile, re, secrets
+import io, os, shutil, zipfile, re, secrets, json
 from datetime import datetime, timedelta
 import pytz
 from pathlib import Path
@@ -1150,69 +1150,120 @@ async def reconcile_v2_bulk(
     outstanding_file: UploadFile = File(...),
     current_user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None
 ):
-    """V2 Bulk: Process multiple Bank files x multiple MIS files against one Outstanding file"""
-    global CURRENT_RUN_DIR
-    try:
-        CURRENT_RUN_DIR = new_run_dir()
-        run_id = CURRENT_RUN_DIR.name
-        
-        # 1. Outstanding Processing (Once)
-        out_path = CURRENT_RUN_DIR / "outstanding.xlsx"
-        with open(out_path, "wb") as f: f.write(await outstanding_file.read())
-        
-        norm_out = None
-        try:
-            norm_out = normalize_to_xlsx(out_path)
-            
-            out_clean_df = parse_outstanding_excel_to_clean(norm_out)
-            clean_out_path = save_xlsx(out_clean_df, CURRENT_RUN_DIR / "00_outstanding_cleaned.xlsx")
-            
-            summary_rows = []
-            consolidated_frames = [] # List to hold all final match DFs
-            files_resp = {}  # Map of "filename" -> "download_url"
+    """V2 Bulk: Process multiple Bank files x multiple MIS files against one Outstanding file (STREAMING)"""
     
-            # Stats Aggregation
-            agg_stats = {
-                "step1_bank_rows": 0,
-                "step2_matches": 0,
-                "step3_mis_mapped": 0,
-                "step4_outstanding": 0, # Final Matches
-                "total_amount": 0.0,
-                "unique_patients_set": set() # Use set to track uniqueness across all
-            }
+    # We must read files into memory/disk BEFORE yielding, because UploadFile is not async-safe inside a generator
+    # if the request closes. But we can yield "starting" status first.
+    
+    # Create run dir immediately
+    global CURRENT_RUN_DIR
+    CURRENT_RUN_DIR = new_run_dir()
+    run_id = CURRENT_RUN_DIR.name
+
+    # Save files to disk synchronously to ensure they are available for the generator
+    # (FastAPI UploadFiles are spooled, so we can read them)
+    
+    # 1. Outstanding
+    out_path = CURRENT_RUN_DIR / "outstanding.xlsx"
+    with open(out_path, "wb") as f: f.write(await outstanding_file.read())
+    
+    # 2. MIS Files
+    mis_paths = []
+    for mf in mis_files:
+        m_path = CURRENT_RUN_DIR / f"raw_mis_{mf.filename}"
+        with open(m_path, "wb") as f: 
+            mf.file.seek(0)
+            f.write(mf.file.read())
+            mis_paths.append((mf.filename, m_path))
+
+    # 3. Bank Files
+    bank_paths = []
+    for b_idx, bank_file in enumerate(bank_files):
+        b_name = Path(bank_file.filename).stem
+        b_path = CURRENT_RUN_DIR / f"bank_{b_idx}_{b_name}.xlsx"
+        with open(b_path, "wb") as f: 
+            bank_file.file.seek(0)
+            f.write(bank_file.file.read())
+            bank_paths.append((bank_file.filename, b_path))
+
+    async def bulk_process():
+        try:
+            yield json.dumps({"type": "init", "run_id": run_id, "msg": "Initialized Bulk Run..."}) + "\n"
             
+            # 1. Process Outstanding
+            yield json.dumps({"type": "progress", "msg": "Cleaning Outstanding File..."}) + "\n"
+            norm_out = None
+            out_clean_df = None
+            try:
+                norm_out = normalize_to_xlsx(out_path)
+                out_clean_df = parse_outstanding_excel_to_clean(norm_out)
+                save_xlsx(out_clean_df, CURRENT_RUN_DIR / "00_outstanding_cleaned.xlsx")
+            except Exception as e:
+                yield json.dumps({"type": "error", "msg": f"Outstanding File Error: {str(e)}"}) + "\n"
+                return
+
+            # 2. Pre-process MIS (Optimization)
+            pre_processed_mis = []
+            yield json.dumps({"type": "progress", "msg": f"Pre-processing {len(mis_paths)} MIS files..."}) + "\n"
+            
+            for m_filename, m_path in mis_paths:
+                yield json.dumps({"type": "progress", "msg": f"Cleaning MIS: {m_filename}"}) + "\n"
+                m_norm = None
+                try:
+                    m_norm = normalize_to_xlsx(m_path)
+                    tpa = detect_tpa_choice(m_norm)
+                    mis_clean_df = parse_mis_universal(m_norm, tpa)
+                    
+                    pre_processed_mis.append({
+                        "filename": m_filename,
+                        "df": mis_clean_df,
+                        "tpa": tpa,
+                        "status": "Success",
+                        "error": None
+                    })
+                except Exception as e:
+                    yield json.dumps({"type": "progress", "msg": f"Failed to clean {m_filename}: {e}"}) + "\n"
+                    pre_processed_mis.append({
+                        "filename": m_filename,
+                        "df": None,
+                        "tpa": "Unknown",
+                        "status": "Failed",
+                        "error": str(e)
+                    })
+                finally:
+                    if m_norm and m_norm.exists():
+                        try: os.remove(m_norm)
+                        except: pass
+
+            # 3. Iterate Banks
+            summary_rows = []
+            consolidated_frames = []
+            
+            # Global file registry for final summary
+            all_files_url_map = {} 
+
             detected_banks = set()
             detected_tpas = set()
-    
-            # Helper to register file
+            
+            agg_stats = {
+                "step1_bank_rows": 0, "step2_matches": 0, "step3_mis_mapped": 0,
+                "step4_outstanding": 0, "total_amount": 0.0, "unique_patients_set": set()
+            }
+
             def _reg_file(abs_path: Path):
                 rel_path = abs_path.relative_to(CURRENT_RUN_DIR)
-                files_resp[str(rel_path)] = f"/download/{run_id}/{str(rel_path)}"
-                return str(rel_path)
+                url = f"/download/{run_id}/{str(rel_path)}"
+                all_files_url_map[str(rel_path)] = url
+                return str(rel_path), url
             
-            # Register global files
             _reg_file(CURRENT_RUN_DIR / "00_outstanding_cleaned.xlsx")
-    
-            # Save MIS files locally first
-            mis_paths = []
-            for mf in mis_files:
-                m_path = CURRENT_RUN_DIR / f"raw_mis_{mf.filename}"
-                with open(m_path, "wb") as f: 
-                    mf.file.seek(0)
-                    f.write(mf.file.read())
-                mis_paths.append((mf.filename, m_path))
-    
-            # 2. Iterate Banks
-            for b_idx, bank_file in enumerate(bank_files):
-                b_name = Path(bank_file.filename).stem
-                b_path = CURRENT_RUN_DIR / f"bank_{b_idx}_{b_name}.xlsx"
-                with open(b_path, "wb") as f: 
-                    bank_file.file.seek(0)
-                    f.write(bank_file.file.read())
+
+            for b_filename, b_path in bank_paths:
+                b_name = Path(b_filename).stem
+                yield json.dumps({"type": "progress", "msg": f"Processing Bank: {b_filename}"}) + "\n"
                 
                 b_norm = None
                 try:
-                    # Detect & Clean Bank
                     b_norm = normalize_to_xlsx(b_path)
                     b_type = detect_bank_type(b_norm)
                     detected_banks.add(b_type)
@@ -1223,213 +1274,206 @@ async def reconcile_v2_bulk(
                         bank_clean = clean_raw_bank_statement_axis(b_norm)
                     
                     agg_stats["step1_bank_rows"] += len(bank_clean)
-    
-                    # 3. Iterate MIS
-                    for m_filename, m_path in mis_paths:
-                        m_stem = Path(m_filename).stem
-                        pair_id = f"{b_name}_vs_{m_stem}"
+
+                    # Iterate MIS
+                    for mis_data in pre_processed_mis:
+                        m_filename = mis_data["filename"]
+                        if mis_data["status"] == "Failed":
+                            summary_rows.append({
+                                "Status": "Failed",
+                                "Bank Type": b_type,
+                                "TPA": "Unknown",
+                                "Bank File": b_filename, 
+                                "MIS File": m_filename,
+                                "Error": mis_data['error'], 
+                                "produced_files": {}
+                            })
+                            continue
+
+                        mis_clean_df = mis_data["df"]
+                        tpa = mis_data["tpa"]
+                        detected_tpas.add(tpa)
+                        
+                        yield json.dumps({"type": "progress", "msg": f"Matching {b_filename} vs {m_filename} ({tpa})..."}) + "\n"
+
+                        pair_id = f"{b_name}_vs_{Path(m_filename).stem}"
                         pair_dir = CURRENT_RUN_DIR / pair_id
                         pair_dir.mkdir(exist_ok=True)
                         
-                        m_norm = None
                         try:
-                            # Detect TPA & Clean
-                            m_norm = normalize_to_xlsx(m_path)
-                            tpa = detect_tpa_choice(m_norm)
-                            detected_tpas.add(tpa)
-                            
-                            mis_clean_df = parse_mis_universal(m_norm, tpa)
-                            
-                            # Step 2 Match
-                            step2_match, _ = step2_match_bank_mis_by_utr(bank_clean, mis_clean_df, tpa)
+                            # Step 2
+                            step2_match, _ = step2_match_bank_mis_by_utr(bank_clean, mis_clean_df.copy(), tpa)
                             agg_stats["step2_matches"] += len(step2_match)
-                            agg_stats["step3_mis_mapped"] += len(step2_match) # Reuse for compat
+                            agg_stats["step3_mis_mapped"] += len(step2_match)
                             
-                            
-                            # Filter Outstanding for this TPA
-                            # We must operate on a copy or parse fresh? 
-                            # parse_outstanding_excel_to_clean is expensive? 
-                            # Creating a filtered file per TPA
+                            # Outstanding Filter
                             out_clean_tpa = filter_outstanding_for_tpa(out_clean_df.copy(), tpa)
                             tpa_out_path = save_xlsx(out_clean_tpa, CURRENT_RUN_DIR / f" outstanding_{tpa[:10]}_filtered.xlsx")
                             
-                            # Step 4 Match (Strict)
+                            # Step 4
                             final_match, final_unmatched = run_step4_plan(step2_match, tpa_out_path, tpa)
                             
-                            # Aggregate Final Stats
                             agg_stats["step4_outstanding"] += len(final_match)
-                            
                             if "Transaction Amount(INR)_bank" in final_match.columns:
                                  amt = final_match["Transaction Amount(INR)_bank"].apply(_to_amt).sum()
                                  agg_stats["total_amount"] += amt
-                            
                             if "Patient Name" in final_match.columns:
                                 pats = final_match["Patient Name"].dropna().unique()
                                 agg_stats["unique_patients_set"].update(pats)
-    
-                            # Logic to add to consolidated list
-                            try:
-                                final_match_copy = final_match.copy()
-                                # Insert at position 0
-                                final_match_copy.insert(0, "Pipeline_Source", f"{bank_file.filename} vs {m_filename}")
-                                final_match_copy.insert(1, "Detected Bank", b_type)
-                                final_match_copy.insert(2, "Detected TPA", tpa)
-                                consolidated_frames.append(final_match_copy)
-                            except Exception as ce:
-                                print(f"[Consolidation] Error adding frame: {ce}")
-    
-                            # Save Outputs
+
+                            # Save pair outputs
                             p_bank = save_xlsx(bank_clean, pair_dir / "01_bank_clean.xlsx")
                             p_mis = save_xlsx(mis_clean_df, pair_dir / "02_mis_clean.xlsx")
                             p_s2 = save_xlsx(step2_match, pair_dir / "03_step2_matches.xlsx")
                             p_final = save_xlsx(final_match, pair_dir / "04_final_matches.xlsx")
                             p_unmatched = save_xlsx(final_unmatched, pair_dir / "05_final_unmatched.xlsx")
+
+                            # Register Files & Get URLs (frontend requested specific keys)
+                            fname_bank, url_bank = _reg_file(p_bank)
+                            fname_mis, url_mis = _reg_file(p_mis)
+                            fname_match, url_match = _reg_file(p_final)
+                            # Gap Report is Unmatched
+                            fname_gap, url_gap = _reg_file(p_unmatched) 
+                            # Step 2 Matches
+                            fname_s2, url_s2 = _reg_file(p_s2)
+
+                            # Consolidate
+                            final_match_copy = final_match.copy()
+                            final_match_copy.insert(0, "Pipeline_Source", f"{b_filename} vs {m_filename}")
+                            final_match_copy.insert(1, "Detected Bank", b_type)
+                            final_match_copy.insert(2, "Detected TPA", tpa)
+                            consolidated_frames.append(final_match_copy)
                             
-                            # Register files for this pair
-                            prod_files = {
-                                "Bank Cleaned": _reg_file(p_bank),
-                                "MIS Cleaned": _reg_file(p_mis),
-                                "Step 2 Match": _reg_file(p_s2),
-                                "Final Match": _reg_file(p_final),
-                                "Final Unmatched": _reg_file(p_unmatched)
+                            # Result Object for Frontend (Exact Keys)
+                            produced_files_map = {
+                                "Bank Clean": fname_bank,
+                                "MIS Clean": fname_mis,
+                                "Step 2 Matches": fname_s2,
+                                "Final Matches": fname_match,
+                                "Final Unmatched": fname_gap
                             }
-    
-                            summary_rows.append({
-                                "Bank File": bank_file.filename,
-                                "MIS File": m_filename,
+                            
+                            pair_files_url_map = {
+                                fname_bank: url_bank,
+                                fname_mis: url_mis,
+                                fname_s2: url_s2,
+                                fname_match: url_match,
+                                fname_gap: url_gap
+                            }
+
+                            res_obj = {
+                                "Status": "Success",
                                 "Bank Type": b_type,
                                 "TPA": tpa,
+                                "Bank File": b_filename,
+                                "MIS File": m_filename,
                                 "Bank Rows": len(bank_clean),
                                 "MIS Rows": len(mis_clean_df),
                                 "Step 2 Match": len(step2_match),
                                 "Final Match": len(final_match),
-                                "Status": "Success",
-                                "produced_files": prod_files
-                            })
+                                "produced_files": produced_files_map
+                            }
+                            summary_rows.append(res_obj)
                             
+                            # YIELD PAIR RESULT
+                            yield json.dumps({
+                                "type": "pair_result", 
+                                "data": res_obj,
+                                "files": pair_files_url_map
+                            }) + "\n"
+
                         except Exception as inner_e:
-                            print(f"[Bulk Pair Error] {pair_id}: {inner_e}")
-                            summary_rows.append({
-                                "Bank File": bank_file.filename,
-                                "MIS File": m_filename,
-                                "Error": str(inner_e),
+                            err_obj = {
                                 "Status": "Failed",
-                                "produced_files": {}
-                            })
-                        finally:
-                            if m_norm and m_norm.exists():
-                                try: os.remove(m_norm)
-                                except: pass
-                                
+                                "Bank Type": b_type, 
+                                "TPA": "Unknown",
+                                "Bank File": b_filename, 
+                                "MIS File": m_filename,
+                                "Error": str(inner_e)
+                            }
+                            summary_rows.append(err_obj)
+                            yield json.dumps({"type": "pair_result", "data": err_obj}) + "\n"
+
                 except Exception as b_e:
-                    print(f"[Bulk Bank Error] {b_name}: {b_e}")
-                    summary_rows.append({
-                        "Bank File": bank_file.filename,
-                        "Error": f"Bank Processing Failed: {str(b_e)}",
-                        "Status": "Failed",
-                        "produced_files": {}
-                    })
+                    yield json.dumps({"type": "error", "msg": f"Bank Error {b_filename}: {b_e}"}) + "\n"
                 finally:
-                    if b_norm and b_norm.exists(): 
+                    if b_norm and b_norm.exists():
                         try: os.remove(b_norm)
                         except: pass
 
-            # BUILD THE CONSOLIDATED MASTER SHEET
-            try:
-                if consolidated_frames:
-                    master_df = pd.concat(consolidated_frames, ignore_index=True)
-                    master_path = CURRENT_RUN_DIR / "Final posting sheet (Consolidated).xlsx"
-                    save_xlsx(master_df, master_path)
-                    _reg_file(master_path)
-                else:
-                    print("[Consolidation] No frames to concatenate.")
-            except Exception as me:
-                print(f"[Consolidation] Failed to create master sheet: {me}")
-    
-            # Save Summary
-            pd.DataFrame(summary_rows).to_excel(CURRENT_RUN_DIR / "bulk_summary.xlsx", index=False)
-            _reg_file(CURRENT_RUN_DIR / "bulk_summary.xlsx")
+            # Final Consolidation
+            yield json.dumps({"type": "progress", "msg": "Consolidating all results..."}) + "\n"
             
-            # Create Zip Archive recursively (safe from recursion)
+            if consolidated_frames:
+                master_df = pd.concat(consolidated_frames, ignore_index=True)
+                master_path = CURRENT_RUN_DIR / "Final posting sheet (Consolidated).xlsx"
+                save_xlsx(master_df, master_path)
+                _reg_file(master_path)
+            
+            # Summary Sheet
+            summary_path = CURRENT_RUN_DIR / "Overall Summary Report.xlsx"
+            clean_summary_rows = []
+            for r in summary_rows:
+                # Copy simple fields
+                cr = {k: v for k, v in r.items() if isinstance(v, (str, int, float))}
+                clean_summary_rows.append(cr)
+            
+            pd.DataFrame(clean_summary_rows).to_excel(summary_path, index=False)
+            _reg_file(summary_path)
+
+            # Zip
             zip_temp = RUN_ROOT / f"temp_bulk_{run_id}"
             shutil.make_archive(str(zip_temp), 'zip', CURRENT_RUN_DIR)
             final_zip_name = f"bulk_{run_id}.zip"
             shutil.move(str(zip_temp) + ".zip", CURRENT_RUN_DIR / final_zip_name)
             
-            # Register Zip
-            files_resp[final_zip_name] = f"/download/{run_id}/{final_zip_name}"
-    
-            # --- DB SAVING LOGIC (BULK) ---
-            if current_user and reconciliation_results_collection is not None and fs is not None:
-                 try:
-                    # 1. Upload Zip to GridFS
-                    zip_path = CURRENT_RUN_DIR / final_zip_name
-                    with open(zip_path, "rb") as zf:
+            zip_url = f"/download/{run_id}/{final_zip_name}"
+            
+            # DB Save (Best effort)
+            try:
+                if current_user and reconciliation_results_collection is not None:
+                     with open(CURRENT_RUN_DIR / final_zip_name, "rb") as zf:
                         fid = fs.put(zf, filename=final_zip_name, username=current_user.username)
-                    
-                    # 2. Determine Bank Type & TPA
-                    final_bank_type = list(detected_banks)[0] if len(detected_banks) == 1 else "Multiple"
-                    if len(detected_banks) == 0: final_bank_type = "Unknown"
-                    
-                    final_tpa_name = list(detected_tpas)[0] if len(detected_tpas) == 1 else "Multiple"
-                    if len(detected_tpas) == 0: final_tpa_name = "Unknown"
-    
-                    # 3. IST Time
-                    ist = pytz.timezone('Asia/Kolkata')
-                    timestamp = datetime.now(ist).replace(tzinfo=None)
-    
-                    # 4. Insert Record
-                    rec_doc = {
+                     
+                     final_bank = list(detected_banks)[0] if len(detected_banks)==1 else "Multiple"
+                     final_tpa = list(detected_tpas)[0] if len(detected_tpas)==1 else "Multiple"
+                     
+                     rec_doc = {
                         "username": current_user.username,
                         "run_id": run_id,
-                        "timestamp": timestamp,
-                        "created_at": timestamp,
-                        "bank_type": final_bank_type,
-                        "tpa_name": final_tpa_name,
+                        "timestamp": datetime.now(),
+                        "created_at": datetime.now(),
+                        "bank_type": final_bank,
+                        "tpa_name": final_tpa,
                         "status": "Completed", 
                         "pipeline_mode": "v2_bulk",
-                        "files": files_resp, # Save map of files
+                        "files": all_files_url_map,
                         "summary": {
                             "step4_outstanding": int(agg_stats["step4_outstanding"]),
                             "total_amount": float(agg_stats["total_amount"]),
                             "unique_patients": int(len(agg_stats["unique_patients_set"])),
-                            "step2_matches": int(agg_stats["step2_matches"]),
-                            "step1_bank_rows": int(agg_stats["step1_bank_rows"]),
-                            "step3_mis_mapped": int(agg_stats["step3_mis_mapped"])
+                            "step2_matches": int(agg_stats["step2_matches"])
                         },
                         "zip_file_id": str(fid)
                     }
-                    reconciliation_results_collection.insert_one(rec_doc)
-                    print(f"[DB] Saved Bulk history for {run_id}")
-    
-                 except Exception as e:
-                     print(f"[DB Save Error Bulk] {str(e)}")
+                     reconciliation_results_collection.insert_one(rec_doc)
+            except Exception as dbe:
+                print(f"DB Error: {dbe}")
+
+            yield json.dumps({
+                "type": "final_summary",
+                "data": summary_rows,
+                "files": all_files_url_map,
+                "zip_url": zip_url
+            }) + "\n"
             
-            if current_user:
-                # Force log activity for Bulk run so it shows up in Profile
-                log_activity(
-                    username=current_user.username, 
-                    bank_type=final_bank_type, 
-                    step=4, 
-                    run_id=run_id, 
-                    counts={"final": agg_stats["step4_outstanding"]}, 
-                    success=True,
-                    tpa=final_tpa_name
-                )
-            
-            return {
-                "status": "success",
-                "run_id": run_id,
-                "summary": summary_rows,
-                "files": files_resp,
-                "zip_url": f"/download/{run_id}/{final_zip_name}"
-            }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield json.dumps({"type": "error", "msg": f"Critical Error: {str(e)}"}) + "\n"
         finally:
             if norm_out and norm_out.exists():
                 try: os.remove(norm_out)
                 except: pass
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(400, detail=str(e))
+    return StreamingResponse(bulk_process(), media_type="application/x-ndjson")
