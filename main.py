@@ -20,16 +20,18 @@ from recon_service import (
     parse_mis_universal,
     step2_match_bank_mis_by_utr,
     parse_outstanding_excel_to_clean,
+    classify_step3_matches, # newly imported for frontend parity
+    classify_step4_matches, # newly imported for frontend parity
 
     filter_outstanding_for_tpa,
     run_step4_plan,
-    TPA_MIS_MAPS,
+    get_tpa_mis_maps,
     _CONVERTED_DIR,
 
     _clean_key_series
 )
 
-TPA_CHOICES = sorted(list(TPA_MIS_MAPS.keys()))
+
 
 # ==========================================
 #  AUTHENTICATION SETUP
@@ -48,9 +50,9 @@ try:
         ActivityLog, UserStatsResponse, ActivityResponse, DailyActivityResponse,
         ReconciliationHistoryResponse, ReconciliationSummary,
         SendVerificationEmailRequest, VerifyEmailRequest,
-        ReconciliationFilesResponse
+        ReconciliationFilesResponse, TPAMappingCreate, TPAMappingUpdate, TPAMappingResponse
     )
-    from database import users_collection, activity_logs_collection, reconciliation_results_collection, fs
+    from database import users_collection, activity_logs_collection, reconciliation_results_collection, fs, tpa_mappings_collection
     AUTH_ENABLED = True
 except ImportError:
     print("[WARNING] Authentication modules not found. Running without authentication.")
@@ -73,6 +75,9 @@ except ImportError:
     class ReconciliationSummary(BaseModel): pass
     class SendVerificationEmailRequest(BaseModel): pass
     class VerifyEmailRequest(BaseModel): pass
+    class TPAMappingCreate(BaseModel): pass
+    class TPAMappingUpdate(BaseModel): pass
+    class TPAMappingResponse(BaseModel): pass
 
 try:
     from email_utils import send_verification_email
@@ -168,6 +173,7 @@ def read_clean_icici_advance_excel(xlsx_path: Path, deduplicate: bool = True) ->
     df = pd.concat(tables, ignore_index=True).dropna(how="all").reset_index(drop=True)
     
     df.columns = [str(c).strip().replace(".", "_").replace(" ", "_") for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]
     
     def _cnorm(name): return re.sub(r"[^a-z0-9]", "", name.lower())
     refer_col, msg_col = None, None
@@ -228,6 +234,7 @@ def read_clean_axis_advance_excel(x_path, deduplicate: bool = True) -> pd.DataFr
         raise ValueError("Axis Advance Excel parser: No usable data table found.")
     df = pd.concat(tables, ignore_index=True).dropna(how="all").reset_index(drop=True)
     df.columns = [str(c).strip().replace(".", "_").replace(" ", "_") for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]
     
     def _cnorm(name): return re.sub(r"[^a-z0-9]", "", name.lower())
     utr_col, tranid_col, primary_col = None, None, None
@@ -594,9 +601,84 @@ async def download_file(run_id: str, filename: str, user: UserInDB = Depends(get
 
 @APP.get("/tpa-choices")
 async def get_tpa_choices(user: UserInDB = Depends(get_current_user) if AUTH_ENABLED else None):
-    return {"tpa_choices": TPA_CHOICES}
+    tpa_mis_maps = get_tpa_mis_maps()
+    return {"tpa_choices": sorted(list(tpa_mis_maps.keys()))}
 
 # ----------------- ADMIN ENDPOINTS -----------------
+
+@APP.get("/api/tpa-mappings", response_model=List[TPAMappingResponse])
+async def get_tpa_mappings():
+    """Get all active TPA mappings."""
+    if not AUTH_ENABLED or tpa_mappings_collection is None:
+        raise HTTPException(503, "DB unavailable")
+    mappings = list(tpa_mappings_collection.find())
+    for m in mappings:
+        m["id"] = str(m.pop("_id"))
+    return mappings
+
+@APP.post("/admin/tpa-mappings", response_model=TPAMappingResponse)
+async def create_tpa_mapping(mapping: TPAMappingCreate, current_user: UserInDB = Depends(get_current_admin_user)):
+    """Create a new TPA mapping (Admin only)."""
+    if tpa_mappings_collection is None: raise HTTPException(503, "DB unavailable")
+    
+    existing = tpa_mappings_collection.find_one({"tpa_name": mapping.tpa_name})
+    if existing: raise HTTPException(400, "TPA mapping with this name already exists")
+    
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist).replace(tzinfo=None)
+    doc = mapping.dict()
+    doc["created_at"] = now
+    doc["updated_at"] = now
+    
+    res = tpa_mappings_collection.insert_one(doc)
+    doc["id"] = str(res.inserted_id)
+    return doc
+
+@APP.put("/admin/tpa-mappings/{id}", response_model=TPAMappingResponse)
+async def update_tpa_mapping(id: str, mapping: TPAMappingUpdate, current_user: UserInDB = Depends(get_current_admin_user)):
+    """Update an existing TPA mapping (Admin only)."""
+    from bson.objectid import ObjectId
+    if tpa_mappings_collection is None: raise HTTPException(503, "DB unavailable")
+    
+    try:
+        obj_id = ObjectId(id)
+    except:
+        raise HTTPException(400, "Invalid ID format")
+
+    existing = tpa_mappings_collection.find_one({"_id": obj_id})
+    if not existing: raise HTTPException(404, "TPA mapping not found")
+
+    update_data = {k: v for k, v in mapping.dict().items() if v is not None}
+    if not update_data: return existing
+
+    if "tpa_name" in update_data and update_data["tpa_name"] != existing["tpa_name"]:
+        name_check = tpa_mappings_collection.find_one({"tpa_name": update_data["tpa_name"]})
+        if name_check: raise HTTPException(400, "TPA mapping with this name already exists")
+
+    ist = pytz.timezone('Asia/Kolkata')
+    update_data["updated_at"] = datetime.now(ist).replace(tzinfo=None)
+
+    tpa_mappings_collection.update_one({"_id": obj_id}, {"$set": update_data})
+    
+    updated = tpa_mappings_collection.find_one({"_id": obj_id})
+    updated["id"] = str(updated.pop("_id"))
+    return updated
+
+@APP.delete("/admin/tpa-mappings/{id}")
+async def delete_tpa_mapping(id: str, current_user: UserInDB = Depends(get_current_admin_user)):
+    """Delete a TPA mapping (Admin only)."""
+    from bson.objectid import ObjectId
+    if tpa_mappings_collection is None: raise HTTPException(503, "DB unavailable")
+    
+    try:
+        obj_id = ObjectId(id)
+    except:
+        raise HTTPException(400, "Invalid ID format")
+
+    res = tpa_mappings_collection.delete_one({"_id": obj_id})
+    if res.deleted_count == 0: raise HTTPException(404, "TPA mapping not found")
+    return {"status": "success"}
+
 
 @APP.get("/admin/reconciliations/history")
 async def get_admin_reconciliation_history(
@@ -778,6 +860,8 @@ async def reconcile_step2(current_user: UserInDB = Depends(get_current_user) if 
             }
         }
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(400, detail=str(e))
 
 @APP.post("/reconcile/step3")
@@ -818,6 +902,8 @@ async def reconcile_step3(
             }
         }
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(400, detail=str(e))
 
 @APP.post("/reconcile/step4")
@@ -1063,6 +1149,8 @@ async def reconcile_v2_step2(
                 try: os.remove(norm_mis)
                 except: pass
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(400, detail=str(e))
 
 @APP.post("/reconcile/v2/step3")
@@ -1374,27 +1462,44 @@ async def reconcile_v2_bulk(
                             agg_stats["step2_matches"] += len(step2_match)
                             agg_stats["step3_mis_mapped"] += len(step2_match)
                             
+                            # Step 3 Classification
+                            step3_auto, step3_review, step3_full, step3_metrics = classify_step3_matches(
+                                step2_match, b_type, tpa, run_id
+                            )
+
                             # Outstanding Filter
                             out_clean_tpa = filter_outstanding_for_tpa(out_clean_df.copy(), tpa)
                             tpa_out_path = save_xlsx(out_clean_tpa, CURRENT_RUN_DIR / f" outstanding_{tpa[:10]}_filtered.xlsx")
                             
                             # Step 4
-                            final_match, final_unmatched = run_step4_plan(step2_match, tpa_out_path, tpa)
+                            final_match, final_unmatched = run_step4_plan(step3_auto, tpa_out_path, tpa, keep_internal=True)
                             
-                            agg_stats["step4_outstanding"] += len(final_match)
-                            if "Transaction Amount(INR)_bank" in final_match.columns:
-                                 amt = final_match["Transaction Amount(INR)_bank"].apply(_to_amt).sum()
+                            # Step 4 Classification
+                            step4_auto, step4_review, step4_full, step4_metrics = classify_step4_matches(
+                                final_match, b_type, tpa, run_id
+                            )
+
+                            final_review = (
+                                pd.concat([step3_review, step4_review], ignore_index=True)
+                                if (not step3_review.empty or not step4_review.empty)
+                                else pd.DataFrame()
+                            )
+
+                            agg_stats["step4_outstanding"] += len(step4_auto)
+                            if "Transaction Amount(INR)_bank" in step4_auto.columns:
+                                 amt = step4_auto["Transaction Amount(INR)_bank"].apply(_to_amt).sum()
                                  agg_stats["total_amount"] += amt
-                            if "Patient Name" in final_match.columns:
-                                pats = final_match["Patient Name"].dropna().unique()
+                            if "Patient Name" in step4_auto.columns:
+                                pats = step4_auto["Patient Name"].dropna().unique()
                                 agg_stats["unique_patients_set"].update(pats)
 
                             # Save pair outputs
                             p_bank = save_xlsx(bank_clean, pair_dir / "01_bank_clean.xlsx")
                             p_mis = save_xlsx(mis_clean_df, pair_dir / "02_mis_clean.xlsx")
                             p_s2 = save_xlsx(step2_match, pair_dir / "03_step2_matches.xlsx")
-                            p_final = save_xlsx(final_match, pair_dir / "04_final_matches.xlsx")
+                            p_final = save_xlsx(step4_auto, pair_dir / "04_final_auto.xlsx")
                             p_unmatched = save_xlsx(final_unmatched, pair_dir / "05_final_unmatched.xlsx")
+                            p_review = save_xlsx(final_review, pair_dir / "06_review_queue.xlsx")
 
                             # Register Files & Get URLs (frontend requested specific keys)
                             fname_bank, url_bank = _reg_file(p_bank)
@@ -1404,9 +1509,11 @@ async def reconcile_v2_bulk(
                             fname_gap, url_gap = _reg_file(p_unmatched) 
                             # Step 2 Matches
                             fname_s2, url_s2 = _reg_file(p_s2)
+                            # Review
+                            fname_rev, url_rev = _reg_file(p_review)
 
                             # Consolidate
-                            final_match_copy = final_match.copy()
+                            final_match_copy = step4_auto.copy()
                             final_match_copy.insert(0, "Pipeline_Source", f"{b_filename} vs {m_filename}")
                             final_match_copy.insert(1, "Detected Bank", b_type)
                             final_match_copy.insert(2, "Detected TPA", tpa)
@@ -1418,7 +1525,8 @@ async def reconcile_v2_bulk(
                                 "MIS Clean": fname_mis,
                                 "Step 2 Matches": fname_s2,
                                 "Final Matches": fname_match,
-                                "Final Unmatched": fname_gap
+                                "Gap Report": fname_gap,
+                                "Review Queue": fname_rev
                             }
                             
                             pair_files_url_map = {
@@ -1426,7 +1534,8 @@ async def reconcile_v2_bulk(
                                 fname_mis: url_mis,
                                 fname_s2: url_s2,
                                 fname_match: url_match,
-                                fname_gap: url_gap
+                                fname_gap: url_gap,
+                                fname_rev: url_rev
                             }
 
                             res_obj = {
@@ -1438,7 +1547,8 @@ async def reconcile_v2_bulk(
                                 "Bank Rows": len(bank_clean),
                                 "MIS Rows": len(mis_clean_df),
                                 "Step 2 Match": len(step2_match),
-                                "Final Match": len(final_match),
+                                "Final Match": len(step4_auto),
+                                "Review Match": len(final_review),
                                 "produced_files": produced_files_map
                             }
                             summary_rows.append(res_obj)
@@ -1451,6 +1561,8 @@ async def reconcile_v2_bulk(
                             }) + "\n"
 
                         except Exception as inner_e:
+                            import traceback
+                            traceback.print_exc()
                             err_obj = {
                                 "Status": "Failed",
                                 "Bank Type": b_type, 

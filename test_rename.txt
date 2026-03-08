@@ -1,0 +1,12 @@
+[Database] Loaded .env file for local development
+[MongoDB] Attempting to connect to: mongodb+srv://rgcirc.tubfdka.mongodb.net/?ap...
+[MongoDB] ✅ Connected successfully!
+[MongoDB] ✅ TTL index set to auto-delete after 14 days
+[MongoDB] Database 'recon_db' initialized with collections:
+  - users
+  - activity_logs
+  - reconciliation_results (TTL: 40 days)
+  - fs.files (GridFS)
+  - fs.chunks (GridFS)
+RECON_SERVICE RENAME MAP: {'Instrument/NEFT Date': 'Cheque/ NEFT/ UTR No.', 'AL Number': 'Claim No'}
+UNTITLED41 RENAME MAP: {'Instrument/NEFT No': 'Cheque/ NEFT/ UTR No.', 'AL Number': 'Claim No'}

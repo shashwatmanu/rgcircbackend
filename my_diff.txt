@@ -1,0 +1,45 @@
+113c113
+< FALLBACK_TPA_MIS_MAPS = {
+---
+> TPA_MIS_MAPS = {
+194,210d193
+< def get_tpa_mis_maps() -> Dict[str, Dict[str, str]]:
+<     try:
+<         from database import tpa_mappings_collection
+<         if tpa_mappings_collection is not None:
+<             cursor = tpa_mappings_collection.find()
+<             docs = list(cursor)
+<             if docs:
+<                 return {
+<                     doc["tpa_name"]: {
+<                         "Cheque/ NEFT/ UTR No.": doc["cheque_utr_column"],
+<                         "Claim No": doc["claim_no_column"]
+<                     } for doc in docs
+<                 }
+<     except Exception:
+<         pass
+<     return FALLBACK_TPA_MIS_MAPS
+< 
+741,742c724
+<     tpa_mis_maps = get_tpa_mis_maps()
+<     for tpa_name, mp in tpa_mis_maps.items():
+---
+>     for tpa_name, mp in TPA_MIS_MAPS.items():
+775,776c757
+<     tpa_mis_maps = get_tpa_mis_maps()
+<     if tpa_name not in tpa_mis_maps:
+---
+>     if tpa_name not in TPA_MIS_MAPS:
+779c760
+<     mapping: Dict[str, str] = tpa_mis_maps[tpa_name]
+---
+>     mapping: Dict[str, str] = TPA_MIS_MAPS[tpa_name]
+927,928c908
+<     tpa_mis_maps = get_tpa_mis_maps()
+<     mapping = tpa_mis_maps.get(tpa_name)
+---
+>     mapping = TPA_MIS_MAPS.get(tpa_name)
+1895,1897d1874
+<     if tpa_choice == "IHX (Original MIS)":
+<         return step4_strict_matches(step3_df, out_input, deduplicate=True, keep_internal=keep_internal)
+< 

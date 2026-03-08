@@ -143,3 +143,22 @@ class ReconciliationFilesResponse(BaseModel):
     """Response model for reconciliation file list"""
     run_id: str
     files: Dict[str, str]  # filename -> download_url
+
+# TPA Mapping Models
+class TPAMappingBase(BaseModel):
+    tpa_name: str
+    cheque_utr_column: str
+    claim_no_column: str
+
+class TPAMappingCreate(TPAMappingBase):
+    pass
+
+class TPAMappingUpdate(BaseModel):
+    tpa_name: Optional[str] = None
+    cheque_utr_column: Optional[str] = None
+    claim_no_column: Optional[str] = None
+
+class TPAMappingResponse(TPAMappingBase):
+    id: str
+    created_at: datetime
+    updated_at: datetime

@@ -24,6 +24,7 @@ if not MONGODB_URI:
     users_collection = None
     activity_logs_collection = None
     reconciliation_results_collection = None
+    tpa_mappings_collection = None
     fs = None
 else:
     # Database name
@@ -45,6 +46,8 @@ else:
         users_collection = db["users"]
         activity_logs_collection = db["activity_logs"]
         reconciliation_results_collection = db["reconciliation_results"]  # NEW
+        tpa_mappings_collection = db["tpa_mappings"] # NEW
+
         
         # Initialize GridFS for file storage
         fs = gridfs.GridFS(db)  # NEW
@@ -91,6 +94,7 @@ else:
         users_collection = None
         activity_logs_collection = None
         reconciliation_results_collection = None
+        tpa_mappings_collection = None
         fs = None
     except Exception as e:
         print(f"[MongoDB] ❌ Unexpected error: {e}")
@@ -99,4 +103,5 @@ else:
         users_collection = None
         activity_logs_collection = None
         reconciliation_results_collection = None
+        tpa_mappings_collection = None
         fs = None
